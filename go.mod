@@ -2,8 +2,6 @@ module github.com/signal18/replication-manager
 
 go 1.12
 
-replace github.com/kahing/goofys => github.com/georgyo/goofys v0.21.0
-
 require (
 	github.com/Azure/azure-pipeline-go v0.2.2
 	github.com/Azure/azure-sdk-for-go v33.2.0+incompatible
@@ -123,6 +121,7 @@ require (
 	github.com/xwb1989/sqlparser v0.0.0-20171128062118-da747e0c62c4
 	golang.org/x/crypto v0.0.0-20190510104115-cbcb75029529
 	golang.org/x/net v0.0.0-20200301022130-244492dfa37a
+	golang.org/x/oauth2 v0.0.0-20190402181905-9f3314589c9a // indirect
 	golang.org/x/sys v0.0.0-20200302150141-5c8b2ff67527
 	golang.org/x/text v0.3.2
 	google.golang.org/appengine v1.5.0

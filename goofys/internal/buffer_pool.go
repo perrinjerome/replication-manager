@@ -318,6 +318,13 @@ func (mb *MBuf) WriteFrom(r io.Reader) (n int, err error) {
 	return
 }
 
+func (mb *MBuf) Reset() {
+	mb.rbuf = 0
+	mb.wbuf = 0
+	mb.rp = 0
+	mb.wp = 0
+}
+
 func (mb *MBuf) Close() error {
 	mb.Free()
 	return nil
@@ -416,10 +423,6 @@ func (b *Buffer) Read(p []byte) (n int, err error) {
 	for b.reader == nil && b.err == nil {
 		bufferLog.Debugf("waiting for stream")
 		b.cond.Wait()
-		if b.err != nil {
-			err = b.err
-			return
-		}
 	}
 
 	// we could have received the err before Read was called
@@ -450,6 +453,25 @@ func (b *Buffer) Read(p []byte) (n int, err error) {
 	}
 
 	return
+}
+
+func (b *Buffer) ReInit(r ReaderProvider) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.reader != nil {
+		b.reader.Close()
+		b.reader = nil
+	}
+
+	if b.buf != nil {
+		b.buf.Reset()
+	}
+
+	b.err = nil
+	go func() {
+		b.readLoop(r)
+	}()
 }
 
 func (b *Buffer) Close() (err error) {

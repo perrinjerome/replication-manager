@@ -25,7 +25,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -168,6 +167,7 @@ func NewADLv2(bucket string, flags *FlagStorage, config *ADLv2Config) (*ADLv2, e
 	client.Authorizer = config.Authorizer
 	client.RequestInspector = LogRequest
 	client.ResponseInspector = LogResponse
+	client.Sender.(*http.Client).Transport = GetHTTPTransport()
 
 	b := &ADLv2{
 		flags:  flags,
@@ -177,6 +177,9 @@ func NewADLv2(bucket string, flags *FlagStorage, config *ADLv2Config) (*ADLv2, e
 		cap: Capabilities{
 			DirBlob: true,
 			Name:    "adl2",
+			// tested on 2019-11-07, seems to have same
+			// limit as azblob
+			MaxMultipartSize: 100 * 1024 * 1024,
 		},
 	}
 
@@ -185,6 +188,10 @@ func NewADLv2(bucket string, flags *FlagStorage, config *ADLv2Config) (*ADLv2, e
 
 func (b *ADLv2) Bucket() string {
 	return b.bucket
+}
+
+func (b *ADLv2) Delegate() interface{} {
+	return b
 }
 
 func (b *ADLv2) Init(key string) (err error) {
@@ -214,12 +221,39 @@ func decodeADLv2Error(body io.Reader) (adlErr adl2.DataLakeStorageError, err err
 	return
 }
 
+func adlv2ErrLogHeaders(errCode string, resp *http.Response) {
+	switch errCode {
+	case "MissingRequiredHeader", "UnsupportedHeader":
+		var s strings.Builder
+		for k, _ := range resp.Request.Header {
+			s.WriteString(k)
+			s.WriteString(" ")
+		}
+		adl2Log.Errorf("%v, sent: %v", errCode, s.String())
+	case "InvalidHeaderValue":
+		var s strings.Builder
+		for k, v := range resp.Request.Header {
+			if k != "Authorization" {
+				s.WriteString(k)
+				s.WriteString(":")
+				s.WriteString(v[0])
+				s.WriteString(" ")
+			}
+		}
+		adl2Log.Errorf("%v, sent: %v", errCode, s.String())
+	case "InvalidSourceUri":
+		adl2Log.Errorf("SourceUri: %v",
+			resp.Request.Header.Get("X-Ms-Rename-Source"))
+	}
+}
+
 func mapADLv2Error(resp *http.Response, err error, rawError bool) error {
+
 	if resp == nil {
 		if err != nil {
 			if detailedError, ok := err.(autorest.DetailedError); ok {
 				if urlErr, ok := detailedError.Original.(*url.Error); ok {
-					adl2Log.Errorf("url.Err: %T: %v %v %v", urlErr.Err, urlErr.Err, urlErr.Temporary(), urlErr.Timeout())
+					adl2Log.Errorf("url.Err: %T: %v %v %v %v %v", urlErr.Err, urlErr.Err, urlErr.Temporary(), urlErr.Timeout(), urlErr.Op, urlErr.URL)
 				} else {
 					adl2Log.Errorf("%T: %v", detailedError.Original, detailedError.Original)
 				}
@@ -250,20 +284,7 @@ func mapADLv2Error(resp *http.Response, err error, rawError bool) error {
 				}
 				adlErr, err := decodeADLv2Error(resp.Body)
 				if err == nil {
-					switch *adlErr.Error.Code {
-					case "MissingRequiredHeader", "UnsupportedHeader":
-						var s strings.Builder
-						for k, _ := range resp.Request.Header {
-							s.WriteString(k)
-							s.WriteString(" ")
-						}
-						adl2Log.Errorf("%v, sent: %v",
-							*adlErr.Error.Code,
-							s.String())
-					case "InvalidSourceUri":
-						adl2Log.Errorf("SourceUri: %v",
-							resp.Request.Header.Get("X-Ms-Rename-Source"))
-					}
+					adlv2ErrLogHeaders(*adlErr.Error.Code, resp)
 				}
 			case http.StatusPreconditionFailed:
 				return syscall.EAGAIN
@@ -280,9 +301,29 @@ func mapADLv2Error(resp *http.Response, err error, rawError bool) error {
 				return syscall.EINVAL
 			}
 		}
-	} else {
-		return err
+	} else if resp.StatusCode == http.StatusOK && err != nil {
+		// trying to capture this error:
+		// autorest.DetailedError{Original:(*errors.errorString)(0xc0003eb3f0),
+		// PackageType:"storagedatalake.adl2PathClient",
+		// Method:"List", StatusCode:200, Message:"Failure
+		// responding to request", ServiceError:[]uint8(nil),
+		// Response:(*http.Response)(0xc0016517a0)}
+		// ("storagedatalake.adl2PathClient#List: Failure
+		// responding to request: StatusCode=200 -- Original
+		// Error: Error occurred reading http.Response#Body -
+		// Error = 'read tcp
+		// 10.20.255.49:34194->52.239.155.98:443: read:
+		// connection reset by peer'")
+		if detailedErr, ok := err.(autorest.DetailedError); ok {
+			if detailedErr.Method == "List" &&
+				strings.Contains(detailedErr.Error(),
+					"read: connection reset by peer") {
+				return syscall.ECONNRESET
+			}
+		}
 	}
+
+	return err
 }
 
 func getHeader(resp *http.Response, key string) *string {
@@ -333,6 +374,42 @@ func (b *ADLv2) HeadBlob(param *HeadBlobInput) (*HeadBlobOutput, error) {
 	return &res.HeadBlobOutput, nil
 }
 
+// autorest handles retry based on request errors but doesn't retry on
+// reading body. List is idempotent anyway so we can retry it here
+func (b *ADLv2) listBlobs(param *ListBlobsInput, maxResults *int32) (adl2PathList, error) {
+	var err error
+	var res adl2PathList
+
+	// autorest's DefaultMaxRetry is 3 which seems wrong. Also
+	// read errors are transient and should probably be retried more
+	for attempt := 0; attempt < 30; attempt++ {
+		res, err = b.client.List(context.TODO(), param.Delimiter == nil, b.bucket,
+			NilStr(param.Prefix), NilStr(param.ContinuationToken), maxResults,
+			nil, "", nil, "")
+		err = mapADLv2Error(res.Response.Response, err, false)
+		if err == nil {
+			break
+		} else if err != syscall.ECONNRESET {
+			return res, err
+		} else {
+			// autorest's DefaultRetryDuration is 30s but
+			// that's for failed requests. Read errors is
+			// probably more transient and should be
+			// retried faster
+			if !autorest.DelayForBackoffWithCap(
+				30*time.Millisecond,
+				0,
+				attempt,
+				res.Response.Response.Request.Context().Done()) {
+				return res, err
+			}
+		}
+
+	}
+
+	return res, err
+}
+
 func (b *ADLv2) ListBlobs(param *ListBlobsInput) (*ListBlobsOutput, error) {
 	if param.Delimiter != nil && *param.Delimiter != "/" {
 		return nil, fuse.EINVAL
@@ -343,11 +420,8 @@ func (b *ADLv2) ListBlobs(param *ListBlobsInput) (*ListBlobsOutput, error) {
 		maxResults = PInt32(int32(*param.MaxKeys))
 	}
 
-	res, err := b.client.List(context.TODO(), param.Delimiter == nil, b.bucket,
-		nilStr(param.Prefix), nilStr(param.ContinuationToken), maxResults,
-		nil, "", nil, "")
+	res, err := b.listBlobs(param, maxResults)
 	if err != nil {
-		err = mapADLv2Error(res.Response.Response, err, false)
 		if err == fuse.ENOENT {
 			return &ListBlobsOutput{
 				RequestId: res.Response.Response.Header.Get(ADL2_REQUEST_ID),
@@ -405,7 +479,7 @@ func (b *ADLv2) ListBlobs(param *ListBlobsInput) (*ListBlobsOutput, error) {
 		items = append(items, BlobItemOutput{
 			Key:          &key,
 			ETag:         p.ETag,
-			LastModified: parseADLv2Time(nilStr(p.LastModified)),
+			LastModified: parseADLv2Time(NilStr(p.LastModified)),
 			Size:         uint64(p.contentLength()),
 		})
 	}
@@ -413,11 +487,11 @@ func (b *ADLv2) ListBlobs(param *ListBlobsInput) (*ListBlobsOutput, error) {
 	continuationToken := getHeader(res.Response.Response, "x-ms-continuation")
 
 	return &ListBlobsOutput{
-		Prefixes:          prefixes,
-		Items:             items,
-		ContinuationToken: continuationToken,
-		IsTruncated:       continuationToken != nil,
-		RequestId:         res.Response.Response.Header.Get(ADL2_REQUEST_ID),
+		Prefixes:              prefixes,
+		Items:                 items,
+		NextContinuationToken: continuationToken,
+		IsTruncated:           continuationToken != nil,
+		RequestId:             res.Response.Response.Header.Get(ADL2_REQUEST_ID),
 	}, nil
 }
 
@@ -435,31 +509,8 @@ func (b *ADLv2) DeleteBlob(param *DeleteBlobInput) (*DeleteBlobOutput, error) {
 	return &DeleteBlobOutput{}, nil
 }
 
-func (b *ADLv2) DeleteBlobs(param *DeleteBlobsInput) (ret *DeleteBlobsOutput, err error) {
-	// if we delete a directory that's not empty, ADLv2 returns
-	// 409. That can happen if we want to delete both "dir1" and
-	// "dir1/file" but delete them in the wrong order for example.
-	// sort the blobs so the deepest tree are deleted first to
-	// avoid this problem. unfortunately because of this dependency
-	// it's difficult to delete in parallel
-	sort.Slice(param.Items, func(i, j int) bool {
-		depth1 := len(strings.Split(strings.TrimRight(param.Items[i], "/"), "/"))
-		depth2 := len(strings.Split(strings.TrimRight(param.Items[j], "/"), "/"))
-		if depth1 != depth2 {
-			return depth2 < depth1
-		} else {
-			return strings.Compare(param.Items[i], param.Items[j]) < 0
-		}
-	})
-
-	for _, i := range param.Items {
-		_, err := b.DeleteBlob(&DeleteBlobInput{i})
-		if err != nil {
-			return nil, err
-		}
-
-	}
-	return &DeleteBlobsOutput{}, nil
+func (b *ADLv2) DeleteBlobs(param *DeleteBlobsInput) (*DeleteBlobsOutput, error) {
+	return nil, syscall.ENOTSUP
 }
 
 func (b *ADLv2) RenameBlob(param *RenameBlobInput) (*RenameBlobOutput, error) {
@@ -520,7 +571,7 @@ func (b *ADLv2) GetBlob(param *GetBlobInput) (*GetBlobOutput, error) {
 	}
 
 	res, err := b.client.Read(context.TODO(), b.bucket, param.Key, bytes,
-		"", nil, nilStr(param.IfMatch), "", "", "",
+		"", nil, NilStr(param.IfMatch), "", "", "",
 		"", nil, "")
 	if err != nil {
 		return nil, mapADLv2Error(res.Response.Response, err, false)
@@ -582,7 +633,7 @@ func (b *ADLv2) toADLProperties(metadata map[string]*string) string {
 func (b *ADLv2) create(key string, pathType adl2.PathResourceType, contentType *string,
 	metadata map[string]*string, leaseId string) (resp autorest.Response, err error) {
 	resp, err = b.client.Create(context.TODO(), b.bucket, key,
-		pathType, "", "", "", "", "", "", "", nilStr(contentType),
+		pathType, "", "", "", "", "", "", "", NilStr(contentType),
 		"", "", "", "", leaseId, "", b.toADLProperties(metadata), "", "", "", "", "", "",
 		"", "", "", "", "", nil, "")
 	if err != nil {
@@ -623,7 +674,8 @@ func (b *ADLv2) PutBlob(param *PutBlobInput) (*PutBlobOutput, error) {
 			return nil, err
 		}
 		return &PutBlobOutput{
-			ETag: getHeader(res.Response, "ETag"),
+			ETag:         getHeader(res.Response, "ETag"),
+			LastModified: parseADLv2Time(res.Response.Header.Get("Last-Modified")),
 		}, nil
 	} else {
 		if param.Size == nil {
@@ -655,13 +707,14 @@ func (b *ADLv2) PutBlob(param *PutBlobInput) (*PutBlobOutput, error) {
 			return nil, err
 		}
 
-		flush, err := b.flush(param.Key, size, nilStr(param.ContentType), "")
+		flush, err := b.flush(param.Key, size, NilStr(param.ContentType), "")
 		if err != nil {
 			return nil, err
 		}
 
 		return &PutBlobOutput{
-			ETag: getHeader(flush.Response, "ETag"),
+			ETag:         getHeader(flush.Response, "ETag"),
+			LastModified: parseADLv2Time(flush.Response.Header.Get("Last-Modified")),
 		}, nil
 	}
 }
@@ -707,7 +760,7 @@ func (b *ADLv2) MultipartBlobBegin(param *MultipartBlobBeginInput) (*MultipartBl
 	}
 
 	commitData := &ADLv2MultipartBlobCommitInput{
-		ContentType:    nilStr(param.ContentType),
+		ContentType:    NilStr(param.ContentType),
 		RenewLeaseStop: make(chan bool, 1),
 	}
 
@@ -809,8 +862,9 @@ func (b *ADLv2) MultipartBlobCommit(param *MultipartBlobCommitInput) (*Multipart
 	}
 
 	return &MultipartBlobCommitOutput{
-		ETag:      nil,
-		RequestId: flush.Response.Header.Get(ADL2_REQUEST_ID),
+		LastModified: parseADLv2Time(flush.Response.Header.Get("Last-Modified")),
+		ETag:         getHeader(flush.Response, "ETag"),
+		RequestId:    flush.Response.Header.Get(ADL2_REQUEST_ID),
 	}, nil
 }
 

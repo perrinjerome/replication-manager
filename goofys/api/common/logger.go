@@ -119,27 +119,21 @@ func GetLogger(name string) *LogHandle {
 
 	if logger, ok := loggers[name]; ok {
 		if name != "main" && name != "fuse" {
-			logger.Level = cloudLogLevel
+			logger.SetLevel(cloudLogLevel)
 		}
 		return logger
 	} else {
 		logger := NewLogger(name)
 		loggers[name] = logger
 		if name != "main" && name != "fuse" {
-			logger.Level = cloudLogLevel
+			logger.SetLevel(cloudLogLevel)
 		}
 		return logger
 	}
 }
 
 func GetStdLogger(l *LogHandle, lvl logrus.Level) *glog.Logger {
-	mu.Lock()
-	defer mu.Unlock()
-
-	w := l.Writer()
-	l.Formatter.(*LogHandle).Lvl = &lvl
-	l.Level = lvl
-	return glog.New(w, "", 0)
+	return glog.New(l.WriterLevel(lvl), "", 0)
 }
 
 // retryablehttp logs messages using Printf("[DEBUG|ERR] message")

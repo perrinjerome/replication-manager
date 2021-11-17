@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -49,6 +50,46 @@ type DirHandleEntry struct {
 	Offset fuseops.DirOffset
 }
 
+// Returns true if any char in `inp` has a value < '/'.
+// This should work for unicode also: unicode chars are all greater than 128.
+// See TestHasCharLtSlash for examples.
+func hasCharLtSlash(inp string) bool {
+	for _, c := range inp {
+		if c < '/' {
+			return true
+		}
+	}
+	return false
+}
+
+// Gets the name of the blob/prefix from a full cloud path.
+// See TestCloudPathToName for examples.
+func cloudPathToName(inp string) string {
+	inp = strings.TrimRight(inp, "/")
+	split := strings.Split(inp, "/")
+	return split[len(split)-1]
+}
+
+// Returns true if the last prefix's name or last item's name from the given
+// ListBlobsOutput has a character less than '/'
+// See TestShouldFetchNextListBlobsPage for examples.
+func shouldFetchNextListBlobsPage(resp *ListBlobsOutput) bool {
+	if !resp.IsTruncated {
+		// There is no next page.
+		return false
+	}
+	numPrefixes := len(resp.Prefixes)
+	numItems := len(resp.Items)
+	if numPrefixes > 0 &&
+		hasCharLtSlash(cloudPathToName(*resp.Prefixes[numPrefixes-1].Prefix)) {
+		return true
+	} else if numItems > 0 &&
+		hasCharLtSlash(cloudPathToName(*resp.Items[numItems-1].Key)) {
+		return true
+	}
+	return false
+}
+
 type DirHandle struct {
 	inode *Inode
 
@@ -69,10 +110,17 @@ func NewDirHandle(inode *Inode) (dh *DirHandle) {
 
 func (inode *Inode) OpenDir() (dh *DirHandle) {
 	inode.logFuse("OpenDir")
+	var isS3 bool
 
 	parent := inode.Parent
 	cloud, _ := inode.cloud()
-	_, isS3 := cloud.(*S3Backend)
+
+	// in test we sometimes set cloud to nil to ensure we are not
+	// talking to the cloud
+	if cloud != nil {
+		_, isS3 = cloud.Delegate().(*S3Backend)
+	}
+
 	dir := inode.dir
 	if dir == nil {
 		panic(fmt.Sprintf("%v is not a directory", inode.FullName()))
@@ -290,7 +338,7 @@ func (dh *DirHandle) listObjects(prefix string) (resp *ListBlobsOutput, err erro
 
 		cloud, _ := dh.inode.cloud()
 
-		resp, err := cloud.ListBlobs(params)
+		resp, err := listBlobsSafe(cloud, params)
 		if err != nil {
 			errListChan <- err
 		} else {
@@ -322,6 +370,60 @@ func (dh *DirHandle) listObjects(prefix string) (resp *ListBlobsOutput, err erro
 	case err = <-errListChan:
 		return
 	}
+}
+
+// Sorting order of entries in directories is slightly inconsistent between goofys
+// and azblob, s3. This inconsistency can be a problem if the listing involves
+// multiple pagination results. Call this instead of `cloud.ListBlobs` if you are
+// paginating.
+//
+// Problem: In s3 & azblob, prefixes are returned with '/' => the prefix "2019" is
+// returned as "2019/". So the list api for these backends returns "2019/" after
+// "2019-0001/" because ascii("/") > ascii("-"). This is problematic for goofys if
+// "2019/" is returned in x+1'th batch and "2019-0001/" is returned in x'th; Goofys
+// stores the results as they arrive in a sorted array and expects backends to return
+// entries in a sorted order.
+// We cant just use ordering of s3/azblob because different cloud providers have
+// different sorting strategies when it involes directories. In s3 "a/" > "a-b/".
+// In adlv2 it is opposite.
+//
+// Solution: To deal with this our solution with follows (for all backends). For
+// a single call of ListBlobs, we keep requesting multiple list batches until there
+// is nothing left to list or the last listed entry has all characters > "/"
+// Relavant test case: TestReadDirDash
+func listBlobsSafe(cloud StorageBackend, param *ListBlobsInput) (*ListBlobsOutput, error) {
+	res, err := cloud.ListBlobs(param)
+	if err != nil {
+		return nil, err
+	}
+
+	for shouldFetchNextListBlobsPage(res) {
+		nextReq := &ListBlobsInput{
+			// Inherit Prefix, Delimiter, MaxKeys from original request.
+			Prefix:    param.Prefix,
+			Delimiter: param.Delimiter,
+			MaxKeys:   param.MaxKeys,
+			// Get the continuation token from the result.
+			ContinuationToken: res.NextContinuationToken,
+		}
+		nextRes, err := cloud.ListBlobs(nextReq)
+		if err != nil {
+			return nil, err
+		}
+
+		res = &ListBlobsOutput{
+			// Add new items and prefixes.
+			Prefixes: append(res.Prefixes, nextRes.Prefixes...),
+			Items:    append(res.Items, nextRes.Items...),
+			// Inherit NextContinuationToken, IsTruncated from nextRes.
+			NextContinuationToken: nextRes.NextContinuationToken,
+			IsTruncated:           nextRes.IsTruncated,
+			// We no longer have a single request. This is composite request. Concatenate
+			// new request id to exiting.
+			RequestId: res.RequestId + ", " + nextRes.RequestId,
+		}
+	}
+	return res, nil
 }
 
 // LOCKS_REQUIRED(dh.mu)
@@ -384,7 +486,12 @@ func (dh *DirHandle) ReadDir(offset fuseops.DirOffset) (en *DirHandleEntry, err 
 			}
 
 			if inode := parent.findChildUnlocked(dirName); inode != nil {
-				inode.AttrTime = time.Now()
+				now := time.Now()
+				// don't want to update time if this
+				// inode is setup to never expire
+				if inode.AttrTime.Before(now) {
+					inode.AttrTime = now
+				}
 			} else {
 				inode := NewInode(fs, parent, &dirName)
 				inode.ToDir()
@@ -450,12 +557,16 @@ func (dh *DirHandle) ReadDir(offset fuseops.DirOffset) (en *DirHandleEntry, err 
 	parent.mu.Lock()
 	defer parent.mu.Unlock()
 
-	// Find the first non-stale child inode with offset >= `offset`.
+	// Find the first non-stale child inode with offset >=
+	// `offset`. A stale inode is one that existed before the
+	// first ListBlobs for this dir handle, but is not being
+	// written to (ie: not a new file)
 	var child *Inode
 	for int(offset) < len(parent.dir.Children) {
 		// Note on locking: See comments at Inode::AttrTime, Inode::Parent.
 		childTmp := parent.dir.Children[offset]
-		if childTmp.AttrTime.Before(dh.refreshStartTime) {
+		if atomic.LoadInt32(&childTmp.fileHandles) == 0 &&
+			childTmp.AttrTime.Before(dh.refreshStartTime) {
 			// childTmp.AttrTime < dh.refreshStartTime => the child entry was not
 			// updated from cloud by this dir Handle.
 			// So this is a stale entry that should be removed.
@@ -512,6 +623,8 @@ func (dir *Inode) renameChildren(cloud StorageBackend, prefix string,
 			param.ContinuationToken = res.NextContinuationToken
 		}
 
+		// No need to call listBlobsSafe here because we are reading the results directly
+		// unlike ReadDir which reads the results and stores it in dir object.
 		res, err = cloud.ListBlobs(&param)
 		if err != nil {
 			return
@@ -859,13 +972,11 @@ func (parent *Inode) isEmptyDir(fs *Goofys, name string) (isDir bool, err error)
 	cloud, key := parent.cloud()
 	key = appendChildName(key, name) + "/"
 
-	params := &ListBlobsInput{
+	resp, err := cloud.ListBlobs(&ListBlobsInput{
 		Delimiter: aws.String("/"),
 		MaxKeys:   PUInt32(2),
 		Prefix:    &key,
-	}
-
-	resp, err := cloud.ListBlobs(params)
+	})
 	if err != nil {
 		return false, mapAwsError(err)
 	}
@@ -1109,6 +1220,10 @@ func (parent *Inode) insertSubTree(path string, obj *BlobItemOutput, dirs map[*I
 				inode.ToDir()
 				fs.addDotAndDotDot(inode)
 			}
+			now := time.Now()
+			if inode.AttrTime.Before(now) {
+				inode.AttrTime = now
+			}
 
 			// mark this dir but don't seal anything else
 			// until we get to the leaf
@@ -1191,13 +1306,12 @@ func (parent *Inode) LookUpInodeDir(name string, c chan ListBlobsOutput, errc ch
 	cloud, key := parent.cloud()
 	key = appendChildName(key, name) + "/"
 
-	params := &ListBlobsInput{
+	resp, err := cloud.ListBlobs(&ListBlobsInput{
 		Delimiter: aws.String("/"),
 		MaxKeys:   PUInt32(1),
 		Prefix:    &key,
-	}
+	})
 
-	resp, err := cloud.ListBlobs(params)
 	if err != nil {
 		errc <- err
 		return
@@ -1240,16 +1354,7 @@ func (parent *Inode) LookUpInodeMaybeDir(name string, fullName string) (inode *I
 			inode = NewInode(parent.fs, parent, &name)
 			if !resp.IsDirBlob {
 				// XXX/TODO if both object and object/ exists, return dir
-				inode.Attributes = InodeAttributes{
-					Size:  resp.Size,
-					Mtime: *resp.LastModified,
-				}
-
-				// don't want to point to the attribute because that
-				// can get updated
-				size := inode.Attributes.Size
-				inode.KnownSize = &size
-
+				inode.SetFromBlobItem(&resp.BlobItemOutput)
 			} else {
 				inode.ToDir()
 				if resp.LastModified != nil {

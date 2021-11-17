@@ -24,6 +24,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -34,6 +35,7 @@ import (
 	"github.com/jacobsa/fuse/fuseutil"
 
 	"github.com/sirupsen/logrus"
+	"net/http"
 )
 
 // goofys is a Filey System written in Go. All the backend data is
@@ -53,7 +55,7 @@ type Goofys struct {
 
 	umask uint32
 
-	gcs       bool
+	gcsS3     bool
 	rootAttrs InodeAttributes
 
 	bufferPool *BufferPool
@@ -112,6 +114,8 @@ func NewBackend(bucket string, flags *FlagStorage) (cloud StorageBackend, err er
 		} else {
 			cloud, err = NewS3(bucket, flags, config)
 		}
+	} else if config, ok := flags.Backend.(*GCSConfig); ok {
+		cloud, err = NewGCS(bucket, config)
 	} else {
 		err = fmt.Errorf("Unknown backend config: %T", flags.Backend)
 	}
@@ -161,6 +165,11 @@ func ParseBucketSpec(bucket string) (spec BucketSpec, err error) {
 }
 
 func NewGoofys(ctx context.Context, bucket string, flags *FlagStorage) *Goofys {
+	return newGoofys(ctx, bucket, flags, NewBackend)
+}
+
+func newGoofys(ctx context.Context, bucket string, flags *FlagStorage,
+	newBackend func(string, *FlagStorage) (StorageBackend, error)) *Goofys {
 	// Set up the basic struct.
 	fs := &Goofys{
 		bucket: bucket,
@@ -185,12 +194,12 @@ func NewGoofys(ctx context.Context, bucket string, flags *FlagStorage) *Goofys {
 		s3Log.Level = logrus.DebugLevel
 	}
 
-	cloud, err := NewBackend(bucket, flags)
+	cloud, err := newBackend(bucket, flags)
 	if err != nil {
 		log.Errorf("Unable to setup backend: %v", err)
 		return nil
 	}
-	_, fs.gcs = cloud.(*GCS3)
+	_, fs.gcsS3 = cloud.Delegate().(*GCS3)
 
 	randomObjectName := prefix + (RandStringBytesMaskImprSrc(32))
 	err = cloud.Init(randomObjectName)
@@ -443,12 +452,14 @@ func (fs *Goofys) GetXattr(ctx context.Context,
 
 	op.BytesRead = len(value)
 
-	if len(op.Dst) < op.BytesRead {
-		return syscall.ERANGE
-	} else {
+	if len(op.Dst) != 0 {
+		if len(op.Dst) < op.BytesRead {
+			return syscall.ERANGE
+		}
+
 		copy(op.Dst, value)
-		return
 	}
+	return
 }
 
 func (fs *Goofys) ListXattr(ctx context.Context,
@@ -474,7 +485,7 @@ func (fs *Goofys) ListXattr(ctx context.Context,
 		op.BytesRead += nlen
 	}
 
-	if ncopied < op.BytesRead {
+	if len(op.Dst) != 0 && ncopied < op.BytesRead {
 		err = syscall.ERANGE
 	}
 
@@ -514,6 +525,8 @@ func mapHttpError(status int) error {
 		return fuse.ENOENT
 	case 405:
 		return syscall.ENOTSUP
+	case http.StatusConflict:
+		return syscall.EINTR
 	case 429:
 		return syscall.EAGAIN
 	case 500:
@@ -529,25 +542,31 @@ func mapAwsError(err error) error {
 	}
 
 	if awsErr, ok := err.(awserr.Error); ok {
+		switch awsErr.Code() {
+		case "BucketRegionError":
+			// don't need to log anything, we should detect region after
+			return err
+		case "NoSuchBucket":
+			return syscall.ENXIO
+		case "BucketAlreadyOwnedByYou":
+			return fuse.EEXIST
+		}
+
 		if reqErr, ok := err.(awserr.RequestFailure); ok {
 			// A service error occurred
 			err = mapHttpError(reqErr.StatusCode())
 			if err != nil {
 				return err
 			} else {
-				s3Log.Errorf("code=%v %v msg=%v request=%v\n", reqErr.Message(), reqErr.StatusCode(), awsErr.Code(), reqErr.RequestID())
+				s3Log.Errorf("http=%v %v s3=%v request=%v\n",
+					reqErr.StatusCode(), reqErr.Message(),
+					awsErr.Code(), reqErr.RequestID())
 				return reqErr
 			}
 		} else {
-			switch awsErr.Code() {
-			case "BucketRegionError":
-				// don't need to log anything, we should detect region after
-				return err
-			default:
-				// Generic AWS Error with Code, Message, and original error (if any)
-				s3Log.Errorf("code=%v msg=%v, err=%v\n", awsErr.Code(), awsErr.Message(), awsErr.OrigErr())
-				return awsErr
-			}
+			// Generic AWS Error with Code, Message, and original error (if any)
+			s3Log.Errorf("code=%v msg=%v, err=%v\n", awsErr.Code(), awsErr.Message(), awsErr.OrigErr())
+			return awsErr
 		}
 	} else {
 		return err
@@ -595,7 +614,7 @@ func (fs *Goofys) LookUpInode(
 
 		if expired(inode.AttrTime, fs.flags.StatCacheTTL) {
 			ok = false
-			if inode.fileHandles != 0 {
+			if atomic.LoadInt32(&inode.fileHandles) != 0 {
 				// we have an open file handle, object
 				// in S3 may not represent the true
 				// state of the file anyway, so just
@@ -648,13 +667,38 @@ func (fs *Goofys) LookUpInode(
 			}
 			parent.mu.Unlock()
 		} else {
+			inode.mu.Lock()
+
 			if newInode != nil {
+				// if only size changed, kernel seems to
+				// automatically drop cache
+				if !inode.Attributes.Equal(newInode.Attributes) {
+					inode.logFuse("invalidate cache because attributes changed", inode.Attributes, newInode.Attributes)
+					inode.invalidateCache = true
+				} else if inode.knownETag != nil &&
+					newInode.knownETag != nil &&
+					*inode.knownETag != *newInode.knownETag {
+					// if this is a new file (ie:
+					// inode.knownETag is nil),
+					// then prefer to read our own
+					// write then reading updated
+					// data
+					inode.logFuse("invalidate cache because etag changed", *inode.knownETag, *newInode.knownETag)
+					inode.invalidateCache = true
+				}
+
 				if newInode.Attributes.Mtime.IsZero() {
+					// this can happen if it's an
+					// implicit dir, use the last
+					// known value
 					newInode.Attributes.Mtime = inode.Attributes.Mtime
 				}
 				inode.Attributes = newInode.Attributes
+				inode.knownETag = newInode.knownETag
 			}
 			inode.AttrTime = time.Now()
+
+			inode.mu.Unlock()
 		}
 	}
 
@@ -844,15 +888,34 @@ func (fs *Goofys) OpenFile(
 	}
 
 	fs.mu.Lock()
-	defer fs.mu.Unlock()
 
 	handleID := fs.nextHandleID
 	fs.nextHandleID++
 
 	fs.fileHandles[handleID] = fh
+	fs.mu.Unlock()
 
 	op.Handle = handleID
-	op.KeepPageCache = true
+
+	in.mu.Lock()
+	defer in.mu.Unlock()
+
+	// this flag appears to tell the kernel if this open should
+	// use the page cache or not. "use" here means:
+	//
+	// read will read from cache
+	// write will populate cache
+	//
+	// because we have one flag to control both behaviors, if an
+	// object is updated out-of-band and we need to invalidate
+	// cache, and we write to this object locally, subsequent read
+	// will not read from cache
+	//
+	// see tests TestReadNewFileWithExternalChangesFuse and
+	// TestReadMyOwnWrite*Fuse
+	op.KeepPageCache = !in.invalidateCache
+	fh.keepPageCache = op.KeepPageCache
+	in.invalidateCache = false
 
 	return
 }
@@ -1104,7 +1167,7 @@ func (fs *Goofys) Rename(
 			// flushed it yet, pretend that's ok because
 			// when we flush we will handle the rename
 			inode := parent.findChildUnlocked(op.OldName)
-			if inode != nil && inode.fileHandles != 0 {
+			if inode != nil && atomic.LoadInt32(&inode.fileHandles) != 0 {
 				err = nil
 			}
 		}

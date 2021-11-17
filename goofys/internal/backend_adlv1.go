@@ -22,7 +22,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -109,7 +108,7 @@ func NewADLv1(bucket string, flags *FlagStorage, config *ADLv1Config) (*ADLv1, e
 				}
 			}
 
-			u := uuid.NewV4()
+			u, _ := uuid.NewV4()
 			r.Header.Add(ADL1_REQUEST_ID, u.String())
 
 			if adls1Log.IsLevelEnabled(logrus.DebugLevel) {
@@ -142,6 +141,7 @@ func NewADLv1(bucket string, flags *FlagStorage, config *ADLv1Config) (*ADLv1, e
 	adlClient.BaseClient.Client.RequestInspector = LogRequest
 	adlClient.BaseClient.Client.ResponseInspector = LogResponse
 	adlClient.BaseClient.AdlsFileSystemDNSSuffix = parts[1]
+	adlClient.BaseClient.Sender.(*http.Client).Transport = GetHTTPTransport()
 
 	b := &ADLv1{
 		flags:   flags,
@@ -153,6 +153,11 @@ func NewADLv1(bucket string, flags *FlagStorage, config *ADLv1Config) (*ADLv1, e
 			NoParallelMultipart: true,
 			DirBlob:             true,
 			Name:                "adl",
+			// ADLv1 fails with 404 if we upload data
+			// larger than 30000000 bytes (28.6MB) (28MB
+			// also failed in at one point, but as of
+			// 2019-11-07 seems to work)
+			MaxMultipartSize: 20 * 1024 * 1024,
 		},
 	}
 
@@ -163,7 +168,15 @@ func (b *ADLv1) Bucket() string {
 	return b.bucket
 }
 
+func (b *ADLv1) Delegate() interface{} {
+	return b
+}
+
 func mapADLv1Error(resp *http.Response, err error, rawError bool) error {
+	// TODO(dotslash/khc): Figure out a way to surface these errors before reducing
+	// them to syscall.E<SOMETHING>. The detailed errors can aid in better debugging
+	// without the need to explicitly enabling debug_s3 flag and trying to reproduce
+	// issues.
 	if resp == nil {
 		if err != nil {
 			return syscall.EAGAIN
@@ -339,8 +352,8 @@ func (b *ADLv1) ListBlobs(param *ListBlobsInput) (*ListBlobsOutput, error) {
 		continuationToken = param.StartAfter
 	}
 
-	_, prefixes, items, err := b.appendToListResults(nilStr(param.Prefix),
-		recursive, nilStr(continuationToken), param.MaxKeys, nil, nil)
+	_, prefixes, items, err := b.appendToListResults(NilStr(param.Prefix),
+		recursive, NilStr(continuationToken), param.MaxKeys, nil, nil)
 	if err == fuse.ENOENT {
 		err = nil
 	} else if err != nil {
@@ -348,10 +361,9 @@ func (b *ADLv1) ListBlobs(param *ListBlobsInput) (*ListBlobsOutput, error) {
 	}
 
 	return &ListBlobsOutput{
-		Prefixes:          prefixes,
-		Items:             items,
-		ContinuationToken: nil,
-		IsTruncated:       false,
+		Prefixes:    prefixes,
+		Items:       items,
+		IsTruncated: false,
 	}, nil
 }
 
@@ -367,31 +379,8 @@ func (b *ADLv1) DeleteBlob(param *DeleteBlobInput) (*DeleteBlobOutput, error) {
 	return &DeleteBlobOutput{}, nil
 }
 
-func (b *ADLv1) DeleteBlobs(param *DeleteBlobsInput) (ret *DeleteBlobsOutput, err error) {
-	// if we delete a directory that's not empty, ADLv1 returns
-	// 403. That can happen if we want to delete both "dir1" and
-	// "dir1/file" but delete them in the wrong order for example
-	// sort the blobs so the deepest tree are deleted first to
-	// avoid this problem unfortunately because of this dependency
-	// it's difficult to delete in parallel
-	sort.Slice(param.Items, func(i, j int) bool {
-		depth1 := len(strings.Split(strings.TrimRight(param.Items[i], "/"), "/"))
-		depth2 := len(strings.Split(strings.TrimRight(param.Items[j], "/"), "/"))
-		if depth1 != depth2 {
-			return depth2 < depth1
-		} else {
-			return strings.Compare(param.Items[i], param.Items[j]) < 0
-		}
-	})
-
-	for _, i := range param.Items {
-		_, err := b.DeleteBlob(&DeleteBlobInput{i})
-		if err != nil {
-			return nil, err
-		}
-
-	}
-	return &DeleteBlobsOutput{}, nil
+func (b *ADLv1) DeleteBlobs(param *DeleteBlobsInput) (*DeleteBlobsOutput, error) {
+	return nil, syscall.ENOTSUP
 }
 
 func (b *ADLv1) RenameBlob(param *RenameBlobInput) (*RenameBlobOutput, error) {
@@ -524,7 +513,10 @@ func (b *ADLv1) MultipartBlobBegin(param *MultipartBlobBeginInput) (*MultipartBl
 	// same time.  much of these is not documented anywhere except
 	// in the SDKs:
 	// https://github.com/Azure/azure-data-lake-store-java/blob/f5c270b8cb2ac68536b2cb123d355a874cade34c/src/main/java/com/microsoft/azure/datalake/store/Core.java#L84
-	leaseId := uuid.NewV4()
+	leaseId, err := uuid.NewV4()
+	if err != nil {
+		return nil, err
+	}
 
 	res, err := b.client.Create(context.TODO(), b.account, b.path(param.Key),
 		&ReadSeekerCloser{bytes.NewReader([]byte(""))}, PBool(true), adl.DATA, &leaseId,

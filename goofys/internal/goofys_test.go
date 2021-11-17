@@ -26,7 +26,9 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
+	"reflect"
 	"runtime"
 	"sort"
 	"strconv"
@@ -47,7 +49,7 @@ import (
 	"github.com/Azure/go-autorest/autorest/azure"
 	azureauth "github.com/Azure/go-autorest/autorest/azure/auth"
 
-	"github.com/signal18/replication-manager/go-xattr"
+	"golang.org/x/sys/unix"
 
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseops"
@@ -56,10 +58,13 @@ import (
 	"github.com/sirupsen/logrus"
 
 	. "gopkg.in/check.v1"
+	"runtime/debug"
 )
 
 // so I don't get complains about unused imports
 var ignored = logrus.DebugLevel
+
+const PerTestTimeout = 10 * time.Minute
 
 func currentUid() uint32 {
 	user, err := user.Current()
@@ -100,6 +105,8 @@ type GoofysTest struct {
 	removeBucket []StorageBackend
 
 	env map[string]*string
+
+	timeout chan int
 }
 
 func Test(t *testing.T) {
@@ -134,12 +141,96 @@ func waitFor(t *C, addr string) (err error) {
 	return
 }
 
+func (t *GoofysTest) deleteBlobsParallelly(cloud StorageBackend, blobs []string) error {
+	sem := make(semaphore, 100)
+	sem.P(100)
+	var err error
+	for _, blobOuter := range blobs {
+		sem.V(1)
+		go func(blob string) {
+			defer sem.P(1)
+			_, localerr := cloud.DeleteBlob(&DeleteBlobInput{blob})
+			if localerr != nil && localerr != syscall.ENOENT {
+				err = localerr
+			}
+		}(blobOuter)
+		if err != nil {
+			break
+		}
+	}
+	sem.V(100)
+	return err
+}
+
+// groupByDecresingDepths takes a slice of path strings and returns the paths as
+// groups where each group has the same `depth` - depth(a/b/c)=2, depth(a/b/)=1
+// The groups are returned in decreasing order of depths.
+// - Inp: [] Out: []
+// - Inp: ["a/b1/", "a/b/c1", "a/b2", "a/b/c2"]
+//   Out: [["a/b/c1", "a/b/c2"], ["a/b1/", "a/b2"]]
+// - Inp: ["a/b1/", "z/a/b/c1", "a/b2", "z/a/b/c2"]
+//   Out:	[["z/a/b/c1", "z/a/b/c2"], ["a/b1/", "a/b2"]
+func groupByDecresingDepths(items []string) [][]string {
+	depthToGroup := map[int][]string{}
+	for _, item := range items {
+		depth := len(strings.Split(strings.TrimRight(item, "/"), "/"))
+		if _, ok := depthToGroup[depth]; !ok {
+			depthToGroup[depth] = []string{}
+		}
+		depthToGroup[depth] = append(depthToGroup[depth], item)
+	}
+	decreasingDepths := []int{}
+	for depth := range depthToGroup {
+		decreasingDepths = append(decreasingDepths, depth)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(decreasingDepths)))
+	ret := [][]string{}
+	for _, depth := range decreasingDepths {
+		group, _ := depthToGroup[depth]
+		ret = append(ret, group)
+	}
+	return ret
+}
+
+func (t *GoofysTest) DeleteADLBlobs(cloud StorageBackend, items []string) error {
+	// If we delete a directory that's not empty, ADL{v1|v2} returns failure. That can
+	// happen if we want to delete both "dir1" and "dir1/file" but delete them
+	// in the wrong order.
+	// So we group the items to delete into multiple groups. All items in a group
+	// will have the same depth - depth(/a/b/c) = 2, depth(/a/b/) = 1.
+	// We then iterate over the groups in desc order of depth and delete them parallelly.
+	for _, group := range groupByDecresingDepths(items) {
+		err := t.deleteBlobsParallelly(cloud, group)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *GoofysTest) selectTestConfig(t *C, flags *FlagStorage) (conf S3Config) {
 	(&conf).Init()
 
 	if hasEnv("AWS") {
-		conf.Region = "us-west-2"
-		conf.Profile = os.Getenv("AWS")
+		if isTravis() {
+			conf.Region = "us-east-1"
+		} else {
+			conf.Region = "us-west-2"
+		}
+		profile := os.Getenv("AWS")
+		if profile != "" {
+			if profile != "-" {
+				conf.Profile = profile
+			} else {
+				conf.AccessKey = os.Getenv("AWS_ACCESS_KEY_ID")
+				conf.SecretKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
+			}
+		}
+
+		conf.BucketOwner = os.Getenv("BUCKET_OWNER")
+		if conf.BucketOwner == "" {
+			panic("BUCKET_OWNER is required on AWS")
+		}
 	} else if hasEnv("GCS") {
 		conf.Region = "us-west1"
 		conf.Profile = os.Getenv("GCS")
@@ -173,23 +264,35 @@ func (s *GoofysTest) waitForEmulator(t *C) {
 func (s *GoofysTest) SetUpSuite(t *C) {
 }
 
-func (s *GoofysTest) deleteBucket(t *C, cloud StorageBackend) {
+func (s *GoofysTest) deleteBucket(cloud StorageBackend) error {
 	param := &ListBlobsInput{}
 
+	// Azure need special handling.
+	azureKeysToRemove := make([]string, 0)
 	for {
 		resp, err := cloud.ListBlobs(param)
-		t.Assert(err, IsNil)
+		if err != nil {
+			return err
+		}
 
-		keys := make([]string, 0)
+		keysToRemove := []string{}
 		for _, o := range resp.Items {
-			keys = append(keys, *o.Key)
+			keysToRemove = append(keysToRemove, *o.Key)
 		}
-
-		if len(keys) != 0 {
-			_, err = cloud.DeleteBlobs(&DeleteBlobsInput{Items: keys})
-			t.Assert(err, IsNil)
+		if len(keysToRemove) != 0 {
+			switch cloud.(type) {
+			case *ADLv1, *ADLv2, *AZBlob:
+				// ADLV{1|2} and AZBlob (sometimes) supports directories. => dir can be removed only
+				// after the dir is empty. So we will remove the blobs in reverse depth order via
+				// DeleteADLBlobs after this for loop.
+				azureKeysToRemove = append(azureKeysToRemove, keysToRemove...)
+			default:
+				_, err = cloud.DeleteBlobs(&DeleteBlobsInput{Items: keysToRemove})
+				if err != nil {
+					return err
+				}
+			}
 		}
-
 		if resp.IsTruncated {
 			param.ContinuationToken = resp.NextContinuationToken
 		} else {
@@ -197,13 +300,24 @@ func (s *GoofysTest) deleteBucket(t *C, cloud StorageBackend) {
 		}
 	}
 
+	if len(azureKeysToRemove) != 0 {
+		err := s.DeleteADLBlobs(cloud, azureKeysToRemove)
+		if err != nil {
+			return err
+		}
+	}
+
 	_, err := cloud.RemoveBucket(&RemoveBucketInput{})
-	t.Assert(err, IsNil)
+	return err
 }
 
 func (s *GoofysTest) TearDownTest(t *C) {
+	close(s.timeout)
+	s.timeout = nil
+
 	for _, cloud := range s.removeBucket {
-		s.deleteBucket(t, cloud)
+		err := s.deleteBucket(cloud)
+		t.Assert(err, IsNil)
 	}
 	s.removeBucket = nil
 }
@@ -217,11 +331,14 @@ func (s *GoofysTest) removeBlob(cloud StorageBackend, t *C, blobPath string) {
 }
 
 func (s *GoofysTest) setupBlobs(cloud StorageBackend, t *C, env map[string]*string) {
-	var wg sync.WaitGroup
+
+	// concurrency = 100
+	throttler := make(semaphore, 100)
+	throttler.P(100)
 
 	var globalErr error
 	for path, c := range env {
-		wg.Add(1)
+		throttler.V(1)
 		go func(path string, content *string) {
 			dir := false
 			if content == nil {
@@ -235,8 +352,7 @@ func (s *GoofysTest) setupBlobs(cloud StorageBackend, t *C, env map[string]*stri
 					content = &path
 				}
 			}
-			defer wg.Done()
-
+			defer throttler.P(1)
 			params := &PutBlobInput{
 				Key:  path,
 				Body: bytes.NewReader([]byte(*content)),
@@ -254,34 +370,42 @@ func (s *GoofysTest) setupBlobs(cloud StorageBackend, t *C, env map[string]*stri
 			t.Assert(err, IsNil)
 		}(path, c)
 	}
-	wg.Wait()
+	throttler.V(100)
+	throttler = make(semaphore, 100)
+	throttler.P(100)
 	t.Assert(globalErr, IsNil)
 
-	// double check
-	for path, c := range env {
-		wg.Add(1)
-		go func(path string, content *string) {
-			defer wg.Done()
-			params := &HeadBlobInput{Key: path}
-			res, err := cloud.HeadBlob(params)
-			t.Assert(err, IsNil)
-			if content != nil {
-				t.Assert(res.Size, Equals, uint64(len(*content)))
-			} else if strings.HasSuffix(path, "/") || path == "zero" {
-				t.Assert(res.Size, Equals, uint64(0))
-			} else {
-				t.Assert(res.Size, Equals, uint64(len(path)))
-			}
-		}(path, c)
+	// double check, except on AWS S3, because there we sometimes
+	// hit 404 NoSuchBucket and there's no way to distinguish that
+	// from 404 KeyNotFound
+	if !hasEnv("AWS") {
+		for path, c := range env {
+			throttler.V(1)
+			go func(path string, content *string) {
+				defer throttler.P(1)
+				params := &HeadBlobInput{Key: path}
+				res, err := cloud.HeadBlob(params)
+				t.Assert(err, IsNil)
+				if content != nil {
+					t.Assert(res.Size, Equals, uint64(len(*content)))
+				} else if strings.HasSuffix(path, "/") || path == "zero" {
+					t.Assert(res.Size, Equals, uint64(0))
+				} else {
+					t.Assert(res.Size, Equals, uint64(len(path)))
+				}
+			}(path, c)
+		}
+		throttler.V(100)
+		t.Assert(globalErr, IsNil)
 	}
-	wg.Wait()
-	t.Assert(globalErr, IsNil)
 }
 
 func (s *GoofysTest) setupEnv(t *C, env map[string]*string, public bool) {
 	if public {
-		if s3, ok := s.cloud.(*S3Backend); ok {
+		if s3, ok := s.cloud.Delegate().(*S3Backend); ok {
 			s3.config.ACL = "public-read"
+		} else {
+			t.Error("Not S3 backend")
 		}
 	}
 
@@ -289,7 +413,7 @@ func (s *GoofysTest) setupEnv(t *C, env map[string]*string, public bool) {
 	t.Assert(err, IsNil)
 
 	if !s.emulator {
-		time.Sleep(time.Second)
+		//time.Sleep(time.Second)
 	}
 
 	s.setupBlobs(s.cloud, t, env)
@@ -314,19 +438,53 @@ func (s *GoofysTest) setupDefaultEnv(t *C, public bool) {
 	s.setupEnv(t, s.env, public)
 }
 
+func (s *GoofysTest) setUpTestTimeout(t *C, timeout time.Duration) {
+	if s.timeout != nil {
+		close(s.timeout)
+	}
+	s.timeout = make(chan int)
+	debug.SetTraceback("all")
+	started := time.Now()
+
+	go func() {
+		select {
+		case _, ok := <-s.timeout:
+			if !ok {
+				return
+			}
+		case <-time.After(timeout):
+			panic(fmt.Sprintf("timeout %v reached. Started %v now %v",
+				timeout, started, time.Now()))
+		}
+	}()
+}
+
 func (s *GoofysTest) SetUpTest(t *C) {
-	bucket := "goofys-test-" + RandStringBytesMaskImprSrc(16)
+	log.Infof("Starting at %v", time.Now())
+
+	s.setUpTestTimeout(t, PerTestTimeout)
+
+	var bucket string
+	mount := os.Getenv("MOUNT")
+
+	if mount != "false" {
+		bucket = mount
+	} else {
+		bucket = "goofys-test-" + RandStringBytesMaskImprSrc(16)
+	}
 	uid, gid := MyUserAndGroup()
 	flags := &FlagStorage{
-		DirMode:  0700,
-		FileMode: 0700,
-		Uid:      uint32(uid),
-		Gid:      uint32(gid),
+		DirMode:     0700,
+		FileMode:    0700,
+		Uid:         uint32(uid),
+		Gid:         uint32(gid),
+		HTTPTimeout: 30 * time.Second,
 	}
 
 	cloud := os.Getenv("CLOUD")
 
 	if cloud == "s3" {
+		s.emulator = !hasEnv("AWS")
 		s.waitForEmulator(t)
 
 		conf := s.selectTestConfig(t, flags)
@@ -337,8 +495,11 @@ func (s *GoofysTest) SetUpTest(t *C) {
 
 		s.cloud = s3
 		s3.aws = hasEnv("AWS")
+		if s3.aws {
+			s.cloud = NewS3BucketEventualConsistency(s3)
+		}
 
-		if !hasEnv("MINIO") {
+		if s.emulator {
 			s3.Handlers.Sign.Clear()
 			s3.Handlers.Sign.PushBack(SignV2)
 			s3.Handlers.Sign.PushBackNamed(corehandlers.BuildContentLengthHandler)
@@ -346,7 +507,7 @@ func (s *GoofysTest) SetUpTest(t *C) {
 		_, err = s3.ListBuckets(nil)
 		t.Assert(err, IsNil)
 
-	} else if cloud == "gcs" {
+	} else if cloud == "gcs3" {
 		conf := s.selectTestConfig(t, flags)
 		flags.Backend = &conf
 
@@ -453,14 +614,43 @@ func (s *GoofysTest) SetUpTest(t *C) {
 		s.cloud, err = NewADLv2(bucket, flags, &config)
 		t.Assert(err, IsNil)
 		t.Assert(s.cloud, NotNil)
+	} else if cloud == "gcs" {
+		config := NewGCSConfig()
+		t.Assert(config, NotNil)
+
+		flags.Backend = config
+		var err error
+		s.cloud, err = NewGCS(bucket, config)
+		t.Assert(err, IsNil)
+		t.Assert(s.cloud, NotNil)
 	} else {
 		t.Fatal("Unsupported backend")
 	}
 
-	s.removeBucket = append(s.removeBucket, s.cloud)
-	s.setupDefaultEnv(t, false)
+	if mount == "false" {
+		s.removeBucket = append(s.removeBucket, s.cloud)
+		s.setupDefaultEnv(t, false)
+	} else {
+		_, err := s.cloud.MakeBucket(&MakeBucketInput{})
+		if err == fuse.EEXIST {
+			err = nil
+		}
+		t.Assert(err, IsNil)
+	}
 
-	s.fs = NewGoofys(context.Background(), bucket, flags)
+	if hasEnv("AWS") {
+		s.fs = newGoofys(context.Background(), bucket, flags,
+			func(bucket string, flags *FlagStorage) (StorageBackend, error) {
+				cloud, err := NewBackend(bucket, flags)
+				if err != nil {
+					return nil, err
+				}
+
+				return NewS3BucketEventualConsistency(cloud.(*S3Backend)), nil
+			})
+	} else {
+		s.fs = NewGoofys(context.Background(), bucket, flags)
+	}
 	t.Assert(s.fs, NotNil)
 
 	s.ctx = context.Background()
@@ -552,6 +742,8 @@ func (s *GoofysTest) TestLookUpInode(t *C) {
 }
 
 func (s *GoofysTest) TestPanicWrapper(t *C) {
+	debug.SetTraceback("single")
+
 	fs := FusePanicLogger{s.fs}
 	err := fs.GetInodeAttributes(nil, &fuseops.GetInodeAttributesOp{
 		Inode: 1234,
@@ -900,7 +1092,17 @@ func (s *GoofysTest) testWriteFileAt(t *C, fileName string, offset int64, size i
 	t.Assert(resp.Size, Equals, uint64(size+offset))
 
 	fr := &FileHandleReader{s.fs, fh, offset}
-	diff, err := CompareReader(fr, io.LimitReader(&SeqReader{offset}, size))
+	diff, err := CompareReader(fr, io.LimitReader(&SeqReader{offset}, size), 0)
+	t.Assert(err, IsNil)
+	t.Assert(diff, Equals, -1)
+	t.Assert(fr.offset, Equals, size)
+
+	err = fh.FlushFile()
+	t.Assert(err, IsNil)
+
+	// read again with exact 4KB to catch aligned read case
+	fr = &FileHandleReader{s.fs, fh, offset}
+	diff, err = CompareReader(fr, io.LimitReader(&SeqReader{offset}, size), 4096)
 	t.Assert(err, IsNil)
 	t.Assert(diff, Equals, -1)
 	t.Assert(fr.offset, Equals, size)
@@ -909,8 +1111,16 @@ func (s *GoofysTest) testWriteFileAt(t *C, fileName string, offset int64, size i
 }
 
 func (s *GoofysTest) TestWriteLargeFile(t *C) {
-	s.testWriteFile(t, "testLargeFile", 21*1024*1024, 128*1024)
-	s.testWriteFile(t, "testLargeFile2", 20*1024*1024, 128*1024)
+	s.testWriteFile(t, "testLargeFile", int64(READAHEAD_CHUNK)+1024*1024, 128*1024)
+	s.testWriteFile(t, "testLargeFile2", int64(READAHEAD_CHUNK), 128*1024)
+	s.testWriteFile(t, "testLargeFile3", int64(READAHEAD_CHUNK)+1, 128*1024)
+}
+
+func (s *GoofysTest) TestWriteReallyLargeFile(t *C) {
+	if _, ok := s.cloud.(*S3Backend); ok && s.emulator {
+		t.Skip("seems to be OOM'ing S3proxy 1.8.0")
+	}
+	s.testWriteFile(t, "testLargeFile", 512*1024*1024+1, 128*1024)
 }
 
 func (s *GoofysTest) TestWriteReplicatorThrottle(t *C) {
@@ -969,7 +1179,7 @@ func (s *GoofysTest) TestReadRandom(t *C) {
 
 		// read 5MB+1 from that offset
 		nread := int64(5*1024*1024 + 1)
-		CompareReader(io.LimitReader(fr, nread), io.LimitReader(truth, nread))
+		CompareReader(io.LimitReader(fr, nread), io.LimitReader(truth, nread), 0)
 	}
 }
 
@@ -1037,7 +1247,16 @@ func (s *GoofysTest) TestRenamePreserveMetadata(t *C) {
 }
 
 func (s *GoofysTest) TestRenameLarge(t *C) {
-	s.testWriteFile(t, "large_file", 21*1024*1024, 128*1024)
+	fileSize := int64(2 * 1024 * 1024 * 1024)
+	// AWS S3 can timeout when renaming large file
+	if _, ok := s.cloud.(*S3Backend); ok && s.emulator {
+		// S3proxy runs out of memory on truly large files. We
+		// want to use a large file to test timeout issues
+		// which wouldn't happen on s3proxy anyway
+		fileSize = 21 * 1024 * 1024
+	}
+
+	s.testWriteFile(t, "large_file", fileSize, 128*1024)
 
 	root := s.getRoot(t)
 
@@ -1070,6 +1289,72 @@ func (s *GoofysTest) TestRenameToExisting(t *C) {
 	file2 := root.findChild("file2")
 	t.Assert(file2, NotNil)
 	t.Assert(*file2.Name, Equals, "file2")
+}
+
+func (s *GoofysTest) TestBackendListPagination(t *C) {
+	if _, ok := s.cloud.(*ADLv1); ok {
+		t.Skip("ADLv1 doesn't have pagination")
+	}
+	if s.azurite {
+		// https://github.com/Azure/Azurite/issues/262
+		t.Skip("Azurite doesn't support pagination")
+	}
+
+	var itemsPerPage int
+	switch s.cloud.Delegate().(type) {
+	case *S3Backend, *GCS3:
+		itemsPerPage = 1000
+	case *AZBlob, *ADLv2:
+		itemsPerPage = 5000
+	case *GCSBackend:
+		itemsPerPage = 1000
+	default:
+		t.Fatalf("unknown backend: %T", s.cloud)
+	}
+
+	root := s.getRoot(t)
+	root.dir.mountPrefix = "this_test/"
+
+	blobs := make(map[string]*string)
+	expect := make([]string, 0)
+	for i := 0; i < itemsPerPage+1; i++ {
+		b := fmt.Sprintf("%08v", i)
+		blobs["this_test/"+b] = nil
+		expect = append(expect, b)
+	}
+
+	switch s.cloud.(type) {
+	case *ADLv1, *ADLv2:
+		// these backends don't support parallel delete so I
+		// am doing this here
+		defer func() {
+			var wg sync.WaitGroup
+
+			for b, _ := range blobs {
+				SmallActionsGate.Take(1, true)
+				wg.Add(1)
+
+				go func(key string) {
+					// ignore the error here,
+					// anything we didn't cleanup
+					// will be handled by teardown
+					_, _ = s.cloud.DeleteBlob(&DeleteBlobInput{key})
+					SmallActionsGate.Return(1)
+					wg.Done()
+				}(b)
+			}
+
+			wg.Wait()
+		}()
+	}
+
+	s.setupBlobs(s.cloud, t, blobs)
+
+	dh := root.OpenDir()
+	defer dh.CloseDir()
+
+	children := namesOf(s.readDirFully(t, dh))
+	t.Assert(children, DeepEquals, expect)
 }
 
 func (s *GoofysTest) TestBackendListPrefix(t *C) {
@@ -1116,6 +1401,13 @@ func (s *GoofysTest) TestBackendListPrefix(t *C) {
 	t.Assert(len(res.Prefixes), Equals, 0)
 	t.Assert(len(res.Items), Equals, 0)
 
+	// ListBlobs:
+	// - Case1: If the prefix foo/ is not added explicitly, then ListBlobs foo/ might or might not return foo/.
+	//   In the test setup dir2 is not expliticly created.
+	// - Case2: Else, ListBlobs foo/ must return foo/
+	//   In the test setup dir2/dir3 is expliticly created.
+
+	// ListBlobs:Case1
 	res, err = s.cloud.ListBlobs(&ListBlobsInput{
 		Prefix:    PString("dir2/"),
 		Delimiter: PString("/"),
@@ -1123,13 +1415,15 @@ func (s *GoofysTest) TestBackendListPrefix(t *C) {
 	t.Assert(err, IsNil)
 	t.Assert(len(res.Prefixes), Equals, 1)
 	t.Assert(*res.Prefixes[0].Prefix, Equals, "dir2/dir3/")
-	if s.cloud.Capabilities().DirBlob {
-		t.Assert(len(res.Items), Equals, 1)
+	if len(res.Items) == 1 {
+		// azblob(with hierarchial ns on), adlv1, adlv2.
 		t.Assert(*res.Items[0].Key, Equals, "dir2/")
 	} else {
+		// s3, azblob(with hierarchial ns off)
 		t.Assert(len(res.Items), Equals, 0)
 	}
 
+	// ListBlobs:Case2
 	res, err = s.cloud.ListBlobs(&ListBlobsInput{
 		Prefix:    PString("dir2/dir3/"),
 		Delimiter: PString("/"),
@@ -1140,14 +1434,23 @@ func (s *GoofysTest) TestBackendListPrefix(t *C) {
 	t.Assert(*res.Items[0].Key, Equals, "dir2/dir3/")
 	t.Assert(*res.Items[1].Key, Equals, "dir2/dir3/file4")
 
+	// ListBlobs:Case1
 	res, err = s.cloud.ListBlobs(&ListBlobsInput{
 		Prefix: PString("dir2/"),
 	})
 	t.Assert(err, IsNil)
 	t.Assert(len(res.Prefixes), Equals, 0)
-	t.Assert(len(res.Items), Equals, 2)
-	t.Assert(*res.Items[0].Key, Equals, "dir2/dir3/")
-	t.Assert(*res.Items[1].Key, Equals, "dir2/dir3/file4")
+	if len(res.Items) == 3 {
+		// azblob(with hierarchial ns on), adlv1, adlv2.
+		t.Assert(*res.Items[0].Key, Equals, "dir2/")
+		t.Assert(*res.Items[1].Key, Equals, "dir2/dir3/")
+		t.Assert(*res.Items[2].Key, Equals, "dir2/dir3/file4")
+	} else {
+		// s3, azblob(with hierarchial ns off)
+		t.Assert(len(res.Items), Equals, 2)
+		t.Assert(*res.Items[0].Key, Equals, "dir2/dir3/")
+		t.Assert(*res.Items[1].Key, Equals, "dir2/dir3/file4")
+	}
 
 	res, err = s.cloud.ListBlobs(&ListBlobsInput{
 		Prefix: PString("dir2/dir3/file4"),
@@ -1255,7 +1558,7 @@ func (s *GoofysTest) TestRename(t *C) {
 	err = root.Rename(from, root, to)
 	t.Assert(err, Equals, fuse.ENOENT)
 
-	if s3, ok := s.cloud.(*S3Backend); ok {
+	if s3, ok := s.cloud.Delegate().(*S3Backend); ok {
 		if !hasEnv("GCS") {
 			// not really rename but can be used by rename
 			from, to = s.fs.bucket+"/file2", "new_file"
@@ -1333,9 +1636,7 @@ func (s *GoofysTest) mount(t *C, mountPoint string) {
 		ErrorLogger:             GetStdLogger(NewLogger("fuse"), logrus.ErrorLevel),
 		DisableWritebackCaching: true,
 	}
-	if fuseLog.Level == logrus.DebugLevel {
-		mountCfg.DebugLogger = GetStdLogger(fuseLog, logrus.DebugLevel)
-	}
+	mountCfg.DebugLogger = GetStdLogger(fuseLog, logrus.DebugLevel)
 
 	_, err = fuse.Mount(mountPoint, server, mountCfg)
 	t.Assert(err, IsNil)
@@ -1400,6 +1701,10 @@ func (s *GoofysTest) runFuseTest(t *C, mountPoint string, umount bool, cmdArgs .
 		defer s.umount(t, mountPoint)
 	}
 
+	// if command starts with ./ or ../ then we are executing a
+	// relative path and cannot do chdir
+	chdir := cmdArgs[0][0] != '.'
+
 	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
 	cmd.Env = append(cmd.Env, os.Environ()...)
 	cmd.Env = append(cmd.Env, "FAST=true")
@@ -1413,6 +1718,16 @@ func (s *GoofysTest) runFuseTest(t *C, mountPoint string, umount bool, cmdArgs .
 
 		cmd.Stdout = w
 		cmd.Stderr = w
+	}
+
+	if chdir {
+		oldCwd, err := os.Getwd()
+		t.Assert(err, IsNil)
+
+		err = os.Chdir(mountPoint)
+		t.Assert(err, IsNil)
+
+		defer os.Chdir(oldCwd)
 	}
 
 	err := cmd.Run()
@@ -1475,6 +1790,7 @@ func (s *GoofysTest) TestBenchLs(t *C) {
 	s.fs.flags.TypeCacheTTL = 1 * time.Minute
 	s.fs.flags.StatCacheTTL = 1 * time.Minute
 	mountPoint := "/tmp/mnt" + s.fs.bucket
+	s.setUpTestTimeout(t, 20*time.Minute)
 	s.runFuseTest(t, mountPoint, false, "../bench/bench.sh", "cat", mountPoint, "ls")
 }
 
@@ -1689,12 +2005,19 @@ func (s *GoofysTest) anonymous(t *C) {
 	// On azure this fails because we re-create the bucket with
 	// the same name right away. And well anonymous access is not
 	// implemented yet in our azure backend anyway
-	if _, ok := s.cloud.(*S3Backend); !ok {
+	var s3 *S3Backend
+	var ok bool
+	if s3, ok = s.cloud.Delegate().(*S3Backend); !ok {
 		t.Skip("only for S3")
 	}
 
-	s.deleteBucket(t, s.cloud)
+	err := s.deleteBucket(s.cloud)
+	t.Assert(err, IsNil)
 
+	// use a different bucket name to prevent 409 Conflict from
+	// delete bucket above
+	s.fs.bucket = "goofys-test-" + RandStringBytesMaskImprSrc(16)
+	s3.bucket = s.fs.bucket
 	s.setupDefaultEnv(t, true)
 
 	s.fs = NewGoofys(context.Background(), s.fs.bucket, s.fs.flags)
@@ -1703,18 +2026,20 @@ func (s *GoofysTest) anonymous(t *C) {
 	// should have auto-detected by S3 backend
 	cloud := s.getRoot(t).dir.cloud
 	t.Assert(cloud, NotNil)
-	s3, ok := cloud.(*S3Backend)
+	s3, ok = cloud.Delegate().(*S3Backend)
 	t.Assert(ok, Equals, true)
 
-	if s3.config.Profile != "" {
-		t.Skip("anonymous access is disabled with profile")
-	}
-	t.Assert(s3.awsConfig.Credentials, Equals, credentials.AnonymousCredentials)
+	s3.awsConfig.Credentials = credentials.AnonymousCredentials
+	s3.newS3()
 }
 
 func (s *GoofysTest) disableS3() {
 	time.Sleep(1 * time.Second) // wait for any background goroutines to finish
-	s.fs.inodes[fuseops.RootInodeID].dir.cloud = nil
+	dir := s.fs.inodes[fuseops.RootInodeID].dir
+	dir.cloud = StorageBackendInitError{
+		fmt.Errorf("cloud disabled"),
+		*dir.cloud.Capabilities(),
+	}
 }
 
 func (s *GoofysTest) TestWriteAnonymous(t *C) {
@@ -1861,19 +2186,24 @@ func (s *GoofysTest) TestXAttrGet(t *C) {
 		t.Skip("ADLv1 doesn't support metadata")
 	}
 
-	_, checkETag := s.cloud.(*S3Backend)
+	_, checkETag := s.cloud.Delegate().(*S3Backend)
+	xattrPrefix := s.cloud.Capabilities().Name + "."
 
 	file1, err := s.LookUpInode(t, "file1")
 	t.Assert(err, IsNil)
 
 	names, err := file1.ListXattr()
 	t.Assert(err, IsNil)
-	sort.Strings(names)
-	t.Assert(names, DeepEquals, []string{"s3.etag", "s3.storage-class", "user.name"})
+	expectedXattrs := []string{
+		xattrPrefix + "etag",
+		xattrPrefix + "storage-class",
+		"user.name",
+	}
+	sort.Strings(expectedXattrs)
+	t.Assert(names, DeepEquals, expectedXattrs)
 
 	_, err = file1.GetXattr("user.foobar")
-	// xattr.IsNotExist seems broken on recent version of macOS
-	t.Assert(err, Equals, syscall.ENODATA)
+	t.Assert(err, Equals, unix.ENODATA)
 
 	if checkETag {
 		value, err := file1.GetXattr("s3.etag")
@@ -1888,6 +2218,16 @@ func (s *GoofysTest) TestXAttrGet(t *C) {
 
 	dir1, err := s.LookUpInode(t, "dir1")
 	t.Assert(err, IsNil)
+
+	if !s.cloud.Capabilities().DirBlob {
+		// implicit dir blobs don't have s3.etag at all
+		names, err = dir1.ListXattr()
+		t.Assert(err, IsNil)
+		t.Assert(len(names), Equals, 0, Commentf("names: %v", names))
+
+		value, err = dir1.GetXattr(xattrPrefix + "etag")
+		t.Assert(err, Equals, syscall.ENODATA)
+	}
 
 	// list dir1 to populate file3 in cache, then get file3's xattr
 	lookup := fuseops.LookUpInodeOp{
@@ -1920,7 +2260,7 @@ func (s *GoofysTest) TestXAttrGet(t *C) {
 	names, err = emptyDir2.ListXattr()
 	t.Assert(err, IsNil)
 	sort.Strings(names)
-	t.Assert(names, DeepEquals, []string{"s3.etag", "s3.storage-class", "user.name"})
+	t.Assert(names, DeepEquals, expectedXattrs)
 
 	emptyDir, err := s.LookUpInode(t, "empty_dir")
 	t.Assert(err, IsNil)
@@ -1932,20 +2272,10 @@ func (s *GoofysTest) TestXAttrGet(t *C) {
 		t.Assert(string(value), Equals, "\"d41d8cd98f00b204e9800998ecf8427e\"")
 	}
 
-	if !s.cloud.Capabilities().DirBlob {
-		// implicit dir blobs don't have s3.etag at all
-		names, err = dir1.ListXattr()
-		t.Assert(err, IsNil)
-		t.Assert(names, HasLen, 0)
-
-		value, err = dir1.GetXattr("s3.etag")
-		t.Assert(err, Equals, syscall.ENODATA)
-	}
-
 	// s3proxy doesn't support storage class yet
 	if hasEnv("AWS") {
 		cloud := s.getRoot(t).dir.cloud
-		s3, ok := cloud.(*S3Backend)
+		s3, ok := cloud.Delegate().(*S3Backend)
 		t.Assert(ok, Equals, true)
 		s3.config.StorageClass = "STANDARD_IA"
 
@@ -2036,6 +2366,8 @@ func (s *GoofysTest) TestXAttrGetCached(t *C) {
 		t.Skip("ADLv1 doesn't support metadata")
 	}
 
+	xattrPrefix := s.cloud.Capabilities().Name + "."
+
 	s.fs.flags.StatCacheTTL = 1 * time.Minute
 	s.fs.flags.TypeCacheTTL = 1 * time.Minute
 	s.readDirIntoCache(t, fuseops.RootInodeID)
@@ -2045,7 +2377,7 @@ func (s *GoofysTest) TestXAttrGetCached(t *C) {
 	t.Assert(err, IsNil)
 	t.Assert(in.userMetadata, IsNil)
 
-	_, err = in.GetXattr("s3.etag")
+	_, err = in.GetXattr(xattrPrefix + "etag")
 	t.Assert(err, IsNil)
 }
 
@@ -2084,6 +2416,86 @@ func (s *GoofysTest) TestXAttrRemove(t *C) {
 	t.Assert(err, Equals, syscall.ENODATA)
 }
 
+func (s *GoofysTest) TestXAttrFuse(t *C) {
+	if _, ok := s.cloud.(*ADLv1); ok {
+		t.Skip("ADLv1 doesn't support metadata")
+	}
+
+	_, checkETag := s.cloud.Delegate().(*S3Backend)
+	xattrPrefix := s.cloud.Capabilities().Name + "."
+
+	//fuseLog.Level = logrus.DebugLevel
+	mountPoint := "/tmp/mnt" + s.fs.bucket
+	s.mount(t, mountPoint)
+	defer s.umount(t, mountPoint)
+
+	expectedXattrs := []string{
+		xattrPrefix + "etag",
+		xattrPrefix + "storage-class",
+		"user.name",
+	}
+	sort.Strings(expectedXattrs)
+
+	var expectedXattrsStr string
+	for _, x := range expectedXattrs {
+		expectedXattrsStr += x + "\x00"
+	}
+	var buf [1024]byte
+
+	// error if size is too small (but not zero)
+	_, err := unix.Listxattr(mountPoint+"/file1", buf[:1])
+	t.Assert(err, Equals, unix.ERANGE)
+
+	// 0 len buffer means interogate the size of buffer
+	nbytes, err := unix.Listxattr(mountPoint+"/file1", nil)
+	t.Assert(err, Equals, nil)
+	t.Assert(nbytes, Equals, len(expectedXattrsStr))
+
+	nbytes, err = unix.Listxattr(mountPoint+"/file1", buf[:nbytes])
+	t.Assert(err, IsNil)
+	t.Assert(nbytes, Equals, len(expectedXattrsStr))
+	t.Assert(string(buf[:nbytes]), Equals, expectedXattrsStr)
+
+	_, err = unix.Getxattr(mountPoint+"/file1", "user.name", buf[:1])
+	t.Assert(err, Equals, unix.ERANGE)
+
+	nbytes, err = unix.Getxattr(mountPoint+"/file1", "user.name", nil)
+	t.Assert(err, IsNil)
+	t.Assert(nbytes, Equals, 9)
+
+	nbytes, err = unix.Getxattr(mountPoint+"/file1", "user.name", buf[:nbytes])
+	t.Assert(err, IsNil)
+	t.Assert(nbytes, Equals, 9)
+	t.Assert(string(buf[:nbytes]), Equals, "file1+/#\x00")
+
+	if !s.cloud.Capabilities().DirBlob {
+		// dir1 has no xattrs
+		nbytes, err = unix.Listxattr(mountPoint+"/dir1", nil)
+		t.Assert(err, IsNil)
+		t.Assert(nbytes, Equals, 0)
+
+		nbytes, err = unix.Listxattr(mountPoint+"/dir1", buf[:1])
+		t.Assert(err, IsNil)
+		t.Assert(nbytes, Equals, 0)
+	}
+
+	if checkETag {
+		_, err = unix.Getxattr(mountPoint+"/file1", "s3.etag", buf[:1])
+		t.Assert(err, Equals, unix.ERANGE)
+
+		nbytes, err = unix.Getxattr(mountPoint+"/file1", "s3.etag", nil)
+		t.Assert(err, IsNil)
+		// 32 bytes md5 plus quotes
+		t.Assert(nbytes, Equals, 34)
+
+		nbytes, err = unix.Getxattr(mountPoint+"/file1", "s3.etag", buf[:nbytes])
+		t.Assert(err, IsNil)
+		t.Assert(nbytes, Equals, 34)
+		t.Assert(string(buf[:nbytes]), Equals,
+			"\"826e8142e6baabe8af779f5f490cf5f5\"")
+	}
+}
+
 func (s *GoofysTest) TestXAttrSet(t *C) {
 	if _, ok := s.cloud.(*ADLv1); ok {
 		t.Skip("ADLv1 doesn't support metadata")
@@ -2092,13 +2504,13 @@ func (s *GoofysTest) TestXAttrSet(t *C) {
 	in, err := s.LookUpInode(t, "file1")
 	t.Assert(err, IsNil)
 
-	err = in.SetXattr("user.bar", []byte("hello"), xattr.REPLACE)
+	err = in.SetXattr("user.bar", []byte("hello"), unix.XATTR_REPLACE)
 	t.Assert(err, Equals, syscall.ENODATA)
 
-	err = in.SetXattr("user.bar", []byte("hello"), xattr.CREATE)
+	err = in.SetXattr("user.bar", []byte("hello"), unix.XATTR_CREATE)
 	t.Assert(err, IsNil)
 
-	err = in.SetXattr("user.bar", []byte("hello"), xattr.CREATE)
+	err = in.SetXattr("user.bar", []byte("hello"), unix.XATTR_CREATE)
 	t.Assert(err, Equals, syscall.EEXIST)
 
 	in, err = s.LookUpInode(t, "file1")
@@ -2110,7 +2522,7 @@ func (s *GoofysTest) TestXAttrSet(t *C) {
 
 	value = []byte("file1+%/#\x00")
 
-	err = in.SetXattr("user.bar", value, xattr.REPLACE)
+	err = in.SetXattr("user.bar", value, unix.XATTR_REPLACE)
 	t.Assert(err, IsNil)
 
 	in, err = s.LookUpInode(t, "file1")
@@ -2135,6 +2547,17 @@ func (s *GoofysTest) TestXAttrSet(t *C) {
 
 	t.Assert(value2, DeepEquals, value)
 	t.Assert(string(value2), DeepEquals, "world")
+
+	err = in.SetXattr("s3.bar", []byte("hello"), unix.XATTR_CREATE)
+	t.Assert(err, Equals, syscall.EPERM)
+}
+
+func (s *GoofysTest) TestPythonCopyTree(t *C) {
+	mountPoint := "/tmp/mnt" + s.fs.bucket
+
+	s.runFuseTest(t, mountPoint, true, "python", "-c",
+		"import shutil; shutil.copytree('dir2', 'dir5')",
+		mountPoint)
 }
 
 func (s *GoofysTest) TestCreateRenameBeforeCloseFuse(t *C) {
@@ -2271,7 +2694,7 @@ func (s *GoofysTest) TestInodeInsert(t *C) {
 }
 
 func (s *GoofysTest) TestReadDirSlurpHeuristic(t *C) {
-	if _, ok := s.cloud.(*S3Backend); !ok {
+	if _, ok := s.cloud.Delegate().(*S3Backend); !ok {
 		t.Skip("only for S3")
 	}
 	s.fs.flags.TypeCacheTTL = 1 * time.Minute
@@ -2304,7 +2727,7 @@ func (s *GoofysTest) TestReadDirSlurpHeuristic(t *C) {
 }
 
 func (s *GoofysTest) TestReadDirSlurpSubtree(t *C) {
-	if _, ok := s.cloud.(*S3Backend); !ok {
+	if _, ok := s.cloud.Delegate().(*S3Backend); !ok {
 		t.Skip("only for S3")
 	}
 	s.fs.flags.TypeCacheTTL = 1 * time.Minute
@@ -2364,17 +2787,18 @@ func (s *GoofysTest) TestReadDirLookUp(t *C) {
 	for i := 0; i < 10; i++ {
 		wg.Add(2)
 		go func() {
+			defer wg.Done()
 			s.readDirIntoCache(t, fuseops.RootInodeID)
-			wg.Done()
 		}()
 		go func() {
+			defer wg.Done()
+
 			lookup := fuseops.LookUpInodeOp{
 				Parent: fuseops.RootInodeID,
 				Name:   "file1",
 			}
 			err := s.fs.LookUpInode(nil, &lookup)
 			t.Assert(err, IsNil)
-			wg.Done()
 		}()
 	}
 	wg.Wait()
@@ -2462,7 +2886,7 @@ func (s *GoofysTest) TestDirMtimeLs(t *C) {
 
 	attr, _ := root.GetAttributes()
 	m1 := attr.Mtime
-	time.Sleep(time.Second)
+	time.Sleep(3 * time.Second)
 
 	params := &PutBlobInput{
 		Key:  "newfile",
@@ -2501,7 +2925,7 @@ func (s *GoofysTest) TestRenameOverwrite(t *C) {
 func (s *GoofysTest) TestRead403(t *C) {
 	// anonymous only works in S3 for now
 	cloud := s.getRoot(t).dir.cloud
-	s3, ok := cloud.(*S3Backend)
+	s3, ok := cloud.Delegate().(*S3Backend)
 	if !ok {
 		t.Skip("only for S3")
 	}
@@ -2739,7 +3163,7 @@ func (s *GoofysTest) TestIssue326(t *C) {
 }
 
 func (s *GoofysTest) TestSlurpFileAndDir(t *C) {
-	if _, ok := s.cloud.(*S3Backend); !ok {
+	if _, ok := s.cloud.Delegate().(*S3Backend); !ok {
 		t.Skip("only for S3")
 	}
 	prefix := "TestSlurpFileAndDir/"
@@ -2905,20 +3329,24 @@ func (s *GoofysTest) TestReadDirLarge(t *C) {
 
 func (s *GoofysTest) newBackend(t *C, bucket string, createBucket bool) (cloud StorageBackend) {
 	var err error
-	switch s.cloud.(type) {
+	switch s.cloud.Delegate().(type) {
 	case *S3Backend:
 		config, _ := s.fs.flags.Backend.(*S3Config)
-		cloud, err = NewS3(bucket, s.fs.flags, config)
+		s3, err := NewS3(bucket, s.fs.flags, config)
 		t.Assert(err, IsNil)
 
-		if s3, ok := cloud.(*S3Backend); ok {
-			s3.aws = hasEnv("AWS")
+		s3.aws = hasEnv("AWS")
 
-			if !hasEnv("MINIO") {
-				s3.Handlers.Sign.Clear()
-				s3.Handlers.Sign.PushBack(SignV2)
-				s3.Handlers.Sign.PushBackNamed(corehandlers.BuildContentLengthHandler)
-			}
+		if s.emulator {
+			s3.Handlers.Sign.Clear()
+			s3.Handlers.Sign.PushBack(SignV2)
+			s3.Handlers.Sign.PushBackNamed(corehandlers.BuildContentLengthHandler)
+		}
+
+		if s3.aws {
+			cloud = NewS3BucketEventualConsistency(s3)
+		} else {
+			cloud = s3
 		}
 	case *GCS3:
 		config, _ := s.fs.flags.Backend.(*S3Config)
@@ -2935,6 +3363,10 @@ func (s *GoofysTest) newBackend(t *C, bucket string, createBucket bool) (cloud S
 	case *ADLv2:
 		config, _ := s.fs.flags.Backend.(*ADLv2Config)
 		cloud, err = NewADLv2(bucket, s.fs.flags, config)
+		t.Assert(err, IsNil)
+	case *GCSBackend:
+		config, _ := s.fs.flags.Backend.(*GCSConfig)
+		cloud, err = NewGCS(bucket, config)
 		t.Assert(err, IsNil)
 	default:
 		t.Fatal("unknown backend")
@@ -3143,8 +3575,10 @@ func (s *GoofysTest) TestMountsNewMounts(t *C) {
 func (s *GoofysTest) TestMountsError(t *C) {
 	bucket := "goofys-test-" + RandStringBytesMaskImprSrc(16)
 	var cloud StorageBackend
-	if s3, ok := s.cloud.(*S3Backend); ok {
-		// S3Backend currently doesn't detect bucket doesn't exist
+	if s3, ok := s.cloud.Delegate().(*S3Backend); ok {
+		// S3Backend can't detect bucket doesn't exist because
+		// HEAD an object always return 404 NotFound (instead
+		// of NoSuchBucket)
 		flags := *s3.flags
 		config := *s3.config
 		flags.Endpoint = "0.0.0.0:0"
@@ -3152,18 +3586,34 @@ func (s *GoofysTest) TestMountsError(t *C) {
 		cloud, err = NewS3(bucket, &flags, &config)
 		t.Assert(err, IsNil)
 	} else if _, ok := s.cloud.(*ADLv1); ok {
-		cloud = s.newBackend(t, bucket, true)
-		adlCloud, _ := cloud.(*ADLv1)
-		account := adlCloud.account
-		adlCloud.account = ""
-		defer func() { adlCloud.account = account }()
+		config, _ := s.fs.flags.Backend.(*ADLv1Config)
+		config.Authorizer = nil
+
+		var err error
+		cloud, err = NewADLv1(bucket, s.fs.flags, config)
+		t.Assert(err, IsNil)
 	} else if _, ok := s.cloud.(*ADLv2); ok {
 		// ADLv2 currently doesn't detect bucket doesn't exist
-		cloud = s.newBackend(t, bucket, true)
+		cloud = s.newBackend(t, bucket, false)
 		adlCloud, _ := cloud.(*ADLv2)
-		account := adlCloud.client.BaseClient.AccountName
-		adlCloud.client.BaseClient.AccountName = ""
-		defer func() { adlCloud.client.BaseClient.AccountName = account }()
+		auth := adlCloud.client.BaseClient.Authorizer
+		adlCloud.client.BaseClient.Authorizer = nil
+		defer func() {
+			adlCloud.client.BaseClient.Authorizer = auth
+		}()
+	} else if _, ok := s.cloud.(*GCSBackend); ok {
+		// We'll trigger a failure on GCS mount by using an unauthenticated client to mount to a private bucket
+		defaultCreds := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+		os.Unsetenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+		defer func() {
+			os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", defaultCreds)
+		}()
+
+		var err error
+		config := NewGCSConfig()
+		cloud, err = NewGCS(s.fs.bucket, config)
+		t.Assert(err, IsNil)
 	} else {
 		cloud = s.newBackend(t, bucket, false)
 	}
@@ -3171,6 +3621,7 @@ func (s *GoofysTest) TestMountsError(t *C) {
 	s.fs.MountAll([]*Mount{
 		&Mount{"dir4/newerror", StorageBackendInitError{
 			fmt.Errorf("foo"),
+			Capabilities{},
 		}, "errprefix1", false},
 		&Mount{"dir4/initerror", &StorageBackendInitWrapper{
 			StorageBackend: cloud,
@@ -3191,6 +3642,12 @@ func (s *GoofysTest) TestMountsError(t *C) {
 
 	_, err = s.LookUpInode(t, "dir4/initerror/not_there")
 	t.Assert(err, Equals, fuse.ENOENT)
+
+	in, err := s.LookUpInode(t, "dir4/initerror")
+	t.Assert(err, IsNil)
+	t.Assert(in, NotNil)
+
+	t.Assert(in.dir.cloud.Capabilities().Name, Equals, cloud.Capabilities().Name)
 }
 
 func (s *GoofysTest) TestMountsMultiLevel(t *C) {
@@ -3415,4 +3872,381 @@ func (s *GoofysTest) TestRmImplicitDir(t *C) {
 	t.Assert(files, DeepEquals, []string{
 		"dir1", "dir4", "empty_dir", "empty_dir2", "file1", "file2", "zero",
 	})
+}
+
+func (s *GoofysTest) TestMount(t *C) {
+	if os.Getenv("MOUNT") == "false" {
+		t.Skip("Not mounting")
+	}
+
+	mountPoint := "/tmp/mnt" + s.fs.bucket
+
+	s.mount(t, mountPoint)
+	defer s.umount(t, mountPoint)
+
+	log.Printf("Mounted at %v", mountPoint)
+
+	c := make(chan os.Signal, 2)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	<-c
+}
+
+// Checks if 2 sorted lists are equal. Returns a helpful error if they differ.
+func checkSortedListsAreEqual(l1, l2 []string) error {
+	i1, i2 := 0, 0
+	onlyl1, onlyl2 := []string{}, []string{}
+	for i1 < len(l1) && i2 < len(l2) {
+		if l1[i1] == l2[i2] {
+			i1++
+			i2++
+		} else if l1[i1] < l2[i2] {
+			onlyl1 = append(onlyl1, fmt.Sprintf("%d:%v", i1, l1[i1]))
+			i1++
+		} else {
+			onlyl2 = append(onlyl2, fmt.Sprintf("%d:%v", i2, l2[i2]))
+			i2++
+		}
+
+	}
+	for ; i1 < len(l1); i1++ {
+		onlyl1 = append(onlyl1, fmt.Sprintf("%d:%v", i1, l1[i1]))
+	}
+	for ; i2 < len(l2); i2++ {
+		onlyl2 = append(onlyl2, fmt.Sprintf("%d:%v", i2, l2[i2]))
+	}
+
+	if len(onlyl1)+len(onlyl2) == 0 {
+		return nil
+	}
+	toString := func(l []string) string {
+		ret := []string{}
+		// The list can contain a lot of elements. Show only ten and say
+		// "and x more".
+		for i := 0; i < len(l) && i < 10; i++ {
+			ret = append(ret, l[i])
+		}
+		if len(ret) < len(l) {
+			ret = append(ret, fmt.Sprintf("and %d more", len(l)-len(ret)))
+		}
+		return strings.Join(ret, ", ")
+	}
+	return fmt.Errorf("only l1: %+v, only l2: %+v",
+		toString(onlyl1), toString(onlyl2))
+}
+
+func (s *GoofysTest) TestReadDirDash(t *C) {
+	if s.azurite {
+		t.Skip("ADLv1 doesn't have pagination")
+	}
+	root := s.getRoot(t)
+	root.dir.mountPrefix = "prefix"
+
+	// SETUP
+	// Add the following blobs
+	// - prefix/2019/1
+	// - prefix/2019-0000 to prefix/2019-4999
+	// - prefix/20190000 to prefix/20194999
+	// Fetching this result will need 3 pages in azure (pagesize 5k) and 11 pages
+	// in amazon (pagesize 1k)
+	// This setup will verify that we paginate and return results correctly before and after
+	// seeing all contents that have a '-' ('-' < '/'). For more context read the comments in
+	// dir.go::listBlobsSafe.
+	blobs := make(map[string]*string)
+	expect := []string{"2019"}
+	blobs["prefix/2019/1"] = nil
+	for i := 0; i < 5000; i++ {
+		name := fmt.Sprintf("2019-%04d", i)
+		expect = append(expect, name)
+		blobs["prefix/"+name] = nil
+	}
+	for i := 0; i < 5000; i++ {
+		name := fmt.Sprintf("2019%04d", i)
+		expect = append(expect, name)
+		blobs["prefix/"+name] = nil
+	}
+	s.setupBlobs(s.cloud, t, blobs)
+
+	// Read the directory and verify its contents.
+	dh := root.OpenDir()
+	defer dh.CloseDir()
+
+	children := namesOf(s.readDirFully(t, dh))
+	t.Assert(checkSortedListsAreEqual(children, expect), IsNil)
+}
+
+func (s *GoofysTest) TestWriteListFlush(t *C) {
+	root := s.getRoot(t)
+	root.dir.mountPrefix = "this_test/"
+
+	dir, err := root.MkDir("dir")
+	t.Assert(err, IsNil)
+	s.fs.insertInode(root, dir)
+
+	in, fh := dir.Create("file1", fuseops.OpMetadata{})
+	t.Assert(in, NotNil)
+	t.Assert(fh, NotNil)
+	s.fs.insertInode(dir, in)
+
+	s.assertEntries(t, dir, []string{"file1"})
+
+	// in should still be valid
+	t.Assert(in.Parent, NotNil)
+	t.Assert(in.Parent, Equals, dir)
+	fh.FlushFile()
+
+	s.assertEntries(t, dir, []string{"file1"})
+}
+
+type includes struct{}
+
+func (c includes) Info() *CheckerInfo {
+	return &CheckerInfo{Name: "includes", Params: []string{"obtained", "expected"}}
+}
+
+func (c includes) Check(params []interface{}, names []string) (res bool, error string) {
+	arr := reflect.ValueOf(params[0])
+	switch arr.Kind() {
+	case reflect.Array, reflect.Slice, reflect.String:
+	default:
+		panic(fmt.Sprintf("%v is not an array", names[0]))
+	}
+
+	for i := 0; i < arr.Len(); i++ {
+		v := arr.Index(i).Interface()
+		res, error = DeepEquals.Check([]interface{}{v, params[1]}, names)
+		if res {
+			return
+		} else {
+			error = ""
+		}
+
+		res = false
+	}
+	return
+}
+
+func (s *GoofysTest) TestWriteUnlinkFlush(t *C) {
+	root := s.getRoot(t)
+
+	dir, err := root.MkDir("dir")
+	t.Assert(err, IsNil)
+	s.fs.insertInode(root, dir)
+
+	in, fh := dir.Create("deleted", fuseops.OpMetadata{})
+	t.Assert(in, NotNil)
+	t.Assert(fh, NotNil)
+	s.fs.insertInode(dir, in)
+
+	err = dir.Unlink("deleted")
+	t.Assert(err, IsNil)
+
+	s.disableS3()
+	err = fh.FlushFile()
+	t.Assert(err, IsNil)
+
+	dh := dir.OpenDir()
+	defer dh.CloseDir()
+	t.Assert(namesOf(s.readDirFully(t, dh)), Not(includes{}), "deleted")
+}
+
+func (s *GoofysTest) TestIssue474(t *C) {
+	s.fs.flags.TypeCacheTTL = 1 * time.Second
+	s.fs.flags.Cheap = true
+
+	p := "this_test/"
+	root := s.getRoot(t)
+	root.dir.mountPrefix = "this_test/"
+	root.dir.seqOpenDirScore = 2
+
+	blobs := make(map[string]*string)
+
+	in := []string{
+		"1/a/b",
+		"2/c/d",
+	}
+
+	for _, s := range in {
+		blobs[p+s] = nil
+	}
+
+	s.setupBlobs(s.cloud, t, blobs)
+
+	dir1, err := s.LookUpInode(t, "1")
+	t.Assert(err, IsNil)
+	// this would list 1/ and slurp in 2/c/d at the same time
+	s.assertEntries(t, dir1, []string{"a"})
+
+	// 2/ will expire and require re-listing. ensure that we don't
+	// remove any children as stale as we update
+	time.Sleep(time.Second)
+
+	dir2, err := s.LookUpInode(t, "2")
+	t.Assert(err, IsNil)
+	s.assertEntries(t, dir2, []string{"c"})
+}
+
+func (s *GoofysTest) TestReadExternalChangesFuse(t *C) {
+	s.fs.flags.StatCacheTTL = 1 * time.Second
+
+	mountPoint := "/tmp/mnt" + s.fs.bucket
+
+	s.mount(t, mountPoint)
+	defer s.umount(t, mountPoint)
+
+	file := "file1"
+	filePath := mountPoint + "/file1"
+
+	buf, err := ioutil.ReadFile(filePath)
+	t.Assert(err, IsNil)
+	t.Assert(string(buf), Equals, file)
+
+	update := "file2"
+	_, err = s.cloud.PutBlob(&PutBlobInput{
+		Key:  file,
+		Body: bytes.NewReader([]byte(update)),
+		Size: PUInt64(uint64(len(update))),
+	})
+	t.Assert(err, IsNil)
+
+	time.Sleep(1 * time.Second)
+
+	buf, err = ioutil.ReadFile(filePath)
+	t.Assert(err, IsNil)
+	t.Assert(string(buf), Equals, update)
+
+	// the next read shouldn't talk to cloud
+	root := s.getRoot(t)
+	root.dir.cloud = &StorageBackendInitError{
+		syscall.EINVAL, *root.dir.cloud.Capabilities(),
+	}
+
+	buf, err = ioutil.ReadFile(filePath)
+	t.Assert(err, IsNil)
+	t.Assert(string(buf), Equals, update)
+}
+
+func (s *GoofysTest) TestReadMyOwnWriteFuse(t *C) {
+	s.testReadMyOwnWriteFuse(t, false)
+}
+
+func (s *GoofysTest) TestReadMyOwnWriteExternalChangesFuse(t *C) {
+	s.testReadMyOwnWriteFuse(t, true)
+}
+
+func (s *GoofysTest) testReadMyOwnWriteFuse(t *C, externalUpdate bool) {
+	s.fs.flags.StatCacheTTL = 1 * time.Second
+
+	mountPoint := "/tmp/mnt" + s.fs.bucket
+
+	s.mount(t, mountPoint)
+	defer s.umount(t, mountPoint)
+
+	file := "file1"
+	filePath := mountPoint + "/file1"
+
+	buf, err := ioutil.ReadFile(filePath)
+	t.Assert(err, IsNil)
+	t.Assert(string(buf), Equals, file)
+
+	if externalUpdate {
+		update := "file2"
+		_, err = s.cloud.PutBlob(&PutBlobInput{
+			Key:  file,
+			Body: bytes.NewReader([]byte(update)),
+			Size: PUInt64(uint64(len(update))),
+		})
+		t.Assert(err, IsNil)
+
+		time.Sleep(s.fs.flags.StatCacheTTL)
+	}
+
+	fh, err := os.Create(filePath)
+	t.Assert(err, IsNil)
+
+	_, err = fh.WriteString("file3")
+	t.Assert(err, IsNil)
+	// we can't flush yet because if we did, we would be reading
+	// the new copy from cloud and that's not the point of this
+	// test
+	defer func() {
+		// want fh to be late-binding because we re-use the variable
+		fh.Close()
+	}()
+
+	buf, err = ioutil.ReadFile(filePath)
+	t.Assert(err, IsNil)
+	if externalUpdate {
+		// if there was an external update, we had set
+		// KeepPageCache to false on os.Create above, which
+		// causes our write to not be in cache, and read here
+		// will go to cloud
+		t.Assert(string(buf), Equals, "file2")
+	} else {
+		t.Assert(string(buf), Equals, "file3")
+	}
+
+	err = fh.Close()
+	t.Assert(err, IsNil)
+
+	time.Sleep(s.fs.flags.StatCacheTTL)
+
+	root := s.getRoot(t)
+	cloud := &TestBackend{root.dir.cloud, nil}
+	root.dir.cloud = cloud
+
+	fh, err = os.Open(filePath)
+	t.Assert(err, IsNil)
+
+	if !externalUpdate {
+		// we flushed and ttl expired, next lookup should
+		// realize nothing is changed and NOT invalidate the
+		// cache. Except ADLv1,GCS because PUT there doesn't
+		// return the mtime, so the open above will think the
+		// file is updated and not re-use cache
+		_, adlv1 := s.cloud.(*ADLv1)
+		_, isGCS := s.cloud.(*GCSBackend)
+		if  !adlv1 && !isGCS {
+			cloud.err = fuse.EINVAL
+		}
+	} else {
+		// if there was externalUpdate, we wrote our own
+		// update with KeepPageCache=false, so we should read
+		// from the cloud her
+	}
+
+	buf, err = ioutil.ReadAll(fh)
+	t.Assert(err, IsNil)
+	t.Assert(string(buf), Equals, "file3")
+}
+
+func (s *GoofysTest) TestReadMyOwnNewFileFuse(t *C) {
+	s.fs.flags.StatCacheTTL = 1 * time.Second
+	s.fs.flags.TypeCacheTTL = 1 * time.Second
+
+	mountPoint := "/tmp/mnt" + s.fs.bucket
+
+	s.mount(t, mountPoint)
+	defer s.umount(t, mountPoint)
+
+	filePath := mountPoint + "/filex"
+
+	// jacobsa/fuse doesn't support setting OpenKeepCache on
+	// CreateFile but even after manually setting in in
+	// fuse/conversions.go, we still receive read ops instead of
+	// being handled by kernel
+
+	fh, err := os.Create(filePath)
+	t.Assert(err, IsNil)
+
+	_, err = fh.WriteString("filex")
+	t.Assert(err, IsNil)
+	// we can't flush yet because if we did, we would be reading
+	// the new copy from cloud and that's not the point of this
+	// test
+	defer fh.Close()
+
+	// disabled: we can't actually read back our own update
+	//buf, err := ioutil.ReadFile(filePath)
+	//t.Assert(err, IsNil)
+	//t.Assert(string(buf), Equals, "filex")
 }

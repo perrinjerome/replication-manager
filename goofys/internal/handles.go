@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseops"
+	"golang.org/x/sys/unix"
 
 	"github.com/sirupsen/logrus"
 )
@@ -35,6 +37,10 @@ import (
 type InodeAttributes struct {
 	Size  uint64
 	Mtime time.Time
+}
+
+func (i InodeAttributes) Equal(other InodeAttributes) bool {
+	return i.Size == other.Size && i.Mtime.Equal(other.Mtime)
 }
 
 type Inode struct {
@@ -65,10 +71,17 @@ type Inode struct {
 	Invalid     bool
 	ImplicitDir bool
 
-	fileHandles uint32
+	fileHandles int32
 
 	userMetadata map[string][]byte
 	s3Metadata   map[string][]byte
+
+	// last known etag from the cloud
+	knownETag *string
+	// tell the next open to invalidate page cache because the
+	// file is changed. This is set when LookUp notices something
+	// about this file is changed
+	invalidateCache bool
 
 	// the refcnt is an exception, it's protected by the global lock
 	// Goofys.mu
@@ -92,25 +105,52 @@ func NewInode(fs *Goofys, parent *Inode, name *string) (inode *Inode) {
 	return
 }
 
+func deepCopyBlobItemOputput(item *BlobItemOutput) BlobItemOutput {
+
+	key := NilStr(item.Key)
+	etag := NilStr(item.ETag)
+	sc := NilStr(item.StorageClass)
+
+	var lastmodified time.Time
+	if item.LastModified != nil {
+		lastmodified = *item.LastModified
+	}
+
+	return BlobItemOutput{
+		Key:          &key,
+		ETag:         &etag,
+		LastModified: &lastmodified,
+		Size:         item.Size,
+		StorageClass: &sc,
+	}
+}
+
 func (inode *Inode) SetFromBlobItem(item *BlobItemOutput) {
+	// copy item so they won't hold back references to the HTTP
+	// responses and SDK objects. See discussion in
+	// https://github.com/signal18/replication-manager/goofys/pull/547
+	itemcopy := deepCopyBlobItemOputput(item)
 	inode.mu.Lock()
 	defer inode.mu.Unlock()
 
-	inode.Attributes.Size = item.Size
-	size := item.Size
+	inode.Attributes.Size = itemcopy.Size
+	// don't want to point to the attribute because that
+	// can get updated
+	size := inode.Attributes.Size
 	inode.KnownSize = &size
 	if item.LastModified != nil {
-		inode.Attributes.Mtime = *item.LastModified
+		inode.Attributes.Mtime = *itemcopy.LastModified
 	} else {
 		inode.Attributes.Mtime = inode.fs.rootAttrs.Mtime
 	}
 	if item.ETag != nil {
-		inode.s3Metadata["etag"] = []byte(*item.ETag)
+		inode.s3Metadata["etag"] = []byte(*itemcopy.ETag)
+		inode.knownETag = itemcopy.ETag
 	} else {
 		delete(inode.s3Metadata, "etag")
 	}
 	if item.StorageClass != nil {
-		inode.s3Metadata["storage-class"] = []byte(*item.StorageClass)
+		inode.s3Metadata["storage-class"] = []byte(*itemcopy.StorageClass)
 	} else {
 		delete(inode.s3Metadata, "storage-class")
 	}
@@ -121,6 +161,7 @@ func (inode *Inode) SetFromBlobItem(item *BlobItemOutput) {
 	}
 }
 
+// LOCKS_REQUIRED(inode.mu)
 func (inode *Inode) cloud() (cloud StorageBackend, path string) {
 	var prefix string
 	var dir *Inode
@@ -325,12 +366,15 @@ func (inode *Inode) fillXattr() (err error) {
 func (inode *Inode) getXattrMap(name string, userOnly bool) (
 	meta map[string][]byte, newName string, err error) {
 
-	if strings.HasPrefix(name, "s3.") {
+	cloud, _ := inode.cloud()
+	xattrPrefix := cloud.Capabilities().Name + "."
+
+	if strings.HasPrefix(name, xattrPrefix) {
 		if userOnly {
-			return nil, "", syscall.EACCES
+			return nil, "", syscall.EPERM
 		}
 
-		newName = name[3:]
+		newName = name[len(xattrPrefix):]
 		meta = inode.s3Metadata
 	} else if strings.HasPrefix(name, "user.") {
 		err = inode.fillXattr()
@@ -342,14 +386,14 @@ func (inode *Inode) getXattrMap(name string, userOnly bool) (
 		meta = inode.userMetadata
 	} else {
 		if userOnly {
-			return nil, "", syscall.EACCES
+			return nil, "", syscall.EPERM
 		} else {
-			return nil, "", syscall.ENODATA
+			return nil, "", unix.ENODATA
 		}
 	}
 
 	if meta == nil {
-		return nil, "", syscall.ENODATA
+		return nil, "", unix.ENODATA
 	}
 
 	return
@@ -378,7 +422,7 @@ func (inode *Inode) updateXattr() (err error) {
 }
 
 func (inode *Inode) SetXattr(name string, value []byte, flags uint32) error {
-	inode.logFuse("RemoveXattr", name)
+	inode.logFuse("SetXattr", name)
 
 	inode.mu.Lock()
 	defer inode.mu.Unlock()
@@ -390,11 +434,11 @@ func (inode *Inode) SetXattr(name string, value []byte, flags uint32) error {
 
 	if flags != 0x0 {
 		_, ok := meta[name]
-		if flags == 0x1 {
+		if flags == unix.XATTR_CREATE {
 			if ok {
 				return syscall.EEXIST
 			}
-		} else if flags == 0x2 {
+		} else if flags == unix.XATTR_REPLACE {
 			if !ok {
 				return syscall.ENODATA
 			}
@@ -458,8 +502,11 @@ func (inode *Inode) ListXattr() ([]string, error) {
 		return nil, err
 	}
 
+	cloud, _ := inode.cloud()
+	cloudXattrPrefix := cloud.Capabilities().Name + "."
+
 	for k, _ := range inode.s3Metadata {
-		xattrs = append(xattrs, "s3."+k)
+		xattrs = append(xattrs, cloudXattrPrefix+k)
 	}
 
 	for k, _ := range inode.userMetadata {
@@ -478,6 +525,7 @@ func (inode *Inode) OpenFile(metadata fuseops.OpMetadata) (fh *FileHandle, err e
 	defer inode.mu.Unlock()
 
 	fh = NewFileHandle(inode, metadata)
-	inode.fileHandles += 1
+
+	atomic.AddInt32(&inode.fileHandles, 1)
 	return
 }

@@ -62,7 +62,8 @@ func NewS3(bucket string, flags *FlagStorage, config *S3Config) (*S3Backend, err
 		flags:     flags,
 		config:    config,
 		cap: Capabilities{
-			Name: "s3",
+			Name:             "s3",
+			MaxMultipartSize: 5 * 1024 * 1024 * 1024,
 		},
 	}
 
@@ -190,7 +191,7 @@ func (s *S3Backend) detectBucketLocationByHEAD() (err error, isAws bool) {
 	case 403:
 		err = syscall.EACCES
 	case 404:
-		err = fuse.ENOENT
+		err = syscall.ENXIO
 	case 405:
 		err = syscall.ENOTSUP
 	default:
@@ -214,7 +215,6 @@ func (s *S3Backend) detectBucketLocationByHEAD() (err error, isAws bool) {
 func (s *S3Backend) testBucket(key string) (err error) {
 	_, err = s.HeadBlob(&HeadBlobInput{Key: key})
 	if err != nil {
-		err = mapAwsError(err)
 		if err == fuse.ENOENT {
 			err = nil
 		}
@@ -245,7 +245,7 @@ func (s *S3Backend) Init(key string) error {
 			// or we can use anonymous access, or both
 			s.newS3()
 			s.aws = isAws
-		} else if err == fuse.ENOENT {
+		} else if err == syscall.ENXIO {
 			return fmt.Errorf("bucket %v does not exist", s.bucket)
 		} else {
 			// this is NOT AWS, we expect the request to fail with 403 if this is not
@@ -257,7 +257,7 @@ func (s *S3Backend) Init(key string) error {
 	}
 
 	// try again with the credential to make sure
-	err = mapAwsError(s.testBucket(key))
+	err = s.testBucket(key)
 	if err != nil {
 		if !isAws {
 			// EMC returns 403 because it doesn't support v4 signing
@@ -268,7 +268,7 @@ func (s *S3Backend) Init(key string) error {
 				if err != nil {
 					return err
 				}
-				err = mapAwsError(s.testBucket(key))
+				err = s.testBucket(key)
 			}
 		}
 
@@ -416,7 +416,6 @@ func (s *S3Backend) ListBlobs(param *ListBlobsInput) (*ListBlobsOutput, error) {
 	}
 
 	return &ListBlobsOutput{
-		ContinuationToken:     param.ContinuationToken,
 		Prefixes:              prefixes,
 		Items:                 items,
 		NextContinuationToken: resp.NextContinuationToken,
@@ -697,6 +696,12 @@ func (s *S3Backend) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, error) {
 	}
 
 	req, _ := s.CopyObjectRequest(params)
+	// make a shallow copy of the client so we can change the
+	// timeout only for this request but still re-use the
+	// connection pool
+	c := *(req.Config.HTTPClient)
+	req.Config.HTTPClient = &c
+	req.Config.HTTPClient.Timeout = 15 * time.Minute
 	err := req.Send()
 	if err != nil {
 		s3Log.Errorf("CopyObject %v = %v", params, err)
@@ -752,6 +757,19 @@ func (s *S3Backend) GetBlob(param *GetBlobInput) (*GetBlobOutput, error) {
 	}, nil
 }
 
+func getDate(resp *http.Response) *time.Time {
+	date := resp.Header.Get("Date")
+	if date != "" {
+		t, err := http.ParseTime(date)
+		if err == nil {
+			return &t
+		}
+		s3Log.Warnf("invalidate date for %v: %v",
+			resp.Request.URL.Path, date)
+	}
+	return nil
+}
+
 func (s *S3Backend) PutBlob(param *PutBlobInput) (*PutBlobOutput, error) {
 	storageClass := s.config.StorageClass
 	if param.Size != nil && *param.Size < 128*1024 && storageClass == "STANDARD_IA" {
@@ -790,6 +808,7 @@ func (s *S3Backend) PutBlob(param *PutBlobInput) (*PutBlobOutput, error) {
 
 	return &PutBlobOutput{
 		ETag:         resp.ETag,
+		LastModified: getDate(req.HTTPResponse),
 		StorageClass: &storageClass,
 		RequestId:    s.getRequestId(req),
 	}, nil
@@ -893,8 +912,9 @@ func (s *S3Backend) MultipartBlobCommit(param *MultipartBlobCommitInput) (*Multi
 	s3Log.Debug(resp)
 
 	return &MultipartBlobCommitOutput{
-		ETag:      resp.ETag,
-		RequestId: s.getRequestId(req),
+		ETag:         resp.ETag,
+		LastModified: getDate(req.HTTPResponse),
+		RequestId:    s.getRequestId(req),
 	}, nil
 }
 
@@ -961,5 +981,38 @@ func (s *S3Backend) MakeBucket(param *MakeBucketInput) (*MakeBucketOutput, error
 	if err != nil {
 		return nil, mapAwsError(err)
 	}
-	return &MakeBucketOutput{}, nil
+
+	if s.config.BucketOwner != "" {
+		var owner s3.Tag
+		owner.SetKey("Owner")
+		owner.SetValue(s.config.BucketOwner)
+
+		param := s3.PutBucketTaggingInput{
+			Bucket: &s.bucket,
+			Tagging: &s3.Tagging{
+				TagSet: []*s3.Tag{&owner},
+			},
+		}
+
+		for i := 0; i < 10; i++ {
+			_, err = s.PutBucketTagging(&param)
+			err = mapAwsError((err))
+			switch err {
+			case nil:
+				break
+			case syscall.ENXIO, syscall.EINTR:
+				s3Log.Infof("waiting for bucket")
+				time.Sleep((time.Duration(i) + 1) * 2 * time.Second)
+			default:
+				s3Log.Errorf("Failed to tag bucket %v: %v", s.bucket, err)
+				return nil, err
+			}
+		}
+	}
+
+	return &MakeBucketOutput{}, err
+}
+
+func (s *S3Backend) Delegate() interface{} {
+	return s
 }

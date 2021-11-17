@@ -18,7 +18,10 @@ import (
 	. "github.com/signal18/replication-manager/goofys/api/common"
 	. "gopkg.in/check.v1"
 
-	"github.com/jacobsa/fuse"
+	"fmt"
+	"sync"
+	"syscall"
+	"time"
 )
 
 type AwsTest struct {
@@ -48,6 +51,161 @@ func (s *AwsTest) TestBucket404(t *C) {
 	s.s3.bucket = RandStringBytesMaskImprSrc(64)
 
 	err, isAws := s.s3.detectBucketLocationByHEAD()
-	t.Assert(err, Equals, fuse.ENOENT)
+	t.Assert(err, Equals, syscall.ENXIO)
 	t.Assert(isAws, Equals, true)
+}
+
+type S3BucketEventualConsistency struct {
+	*S3Backend
+	// a list of blobs ever put by this backend, we speculatively
+	// retry on these blobs to workaround eventual consistency
+	mu    sync.RWMutex
+	blobs map[string]bool
+}
+
+func NewS3BucketEventualConsistency(s *S3Backend) *S3BucketEventualConsistency {
+	return &S3BucketEventualConsistency{
+		s,
+		sync.RWMutex{},
+		make(map[string]bool),
+	}
+}
+
+func (s *S3BucketEventualConsistency) Init(key string) (err error) {
+	// TODO: make Init return errno instead
+	NoSuchBucket := fmt.Sprintf("bucket %v does not exist", s.Bucket())
+
+	for i := 0; i < 10; i++ {
+		err = s.S3Backend.Init(key)
+		if err != nil && err.Error() == NoSuchBucket {
+			s3Log.Infof("waiting for bucket")
+			time.Sleep((time.Duration(i) + 1) * 2 * time.Second)
+		} else {
+			return
+		}
+	}
+
+	return
+}
+
+func (s *S3BucketEventualConsistency) HeadBlob(param *HeadBlobInput) (*HeadBlobOutput, error) {
+	var err error
+	var res *HeadBlobOutput
+
+	for i := 0; i < 10; i++ {
+		res, err = s.S3Backend.HeadBlob(param)
+		switch err {
+		case syscall.ENXIO:
+			s3Log.Infof("waiting for bucket")
+			time.Sleep((time.Duration(i) + 1) * 2 * time.Second)
+		case syscall.ENOENT:
+			s.mu.RLock()
+			_, ok := s.blobs[param.Key]
+			s.mu.RUnlock()
+
+			if ok {
+				s3Log.Infof("waiting for blob: %v", param.Key)
+				time.Sleep((time.Duration(i) + 1) * 20 * time.Millisecond)
+			}
+		default:
+			return res, err
+		}
+	}
+
+	return res, err
+}
+
+func (s *S3BucketEventualConsistency) ListBlobs(param *ListBlobsInput) (*ListBlobsOutput, error) {
+	for i := 0; i < 10; i++ {
+		res, err := s.S3Backend.ListBlobs(param)
+		switch err {
+		case syscall.ENXIO:
+			s3Log.Infof("waiting for bucket")
+			time.Sleep((time.Duration(i) + 1) * 2 * time.Second)
+		default:
+			return res, err
+		}
+	}
+
+	return nil, syscall.ENXIO
+}
+
+func (s *S3BucketEventualConsistency) DeleteBlob(param *DeleteBlobInput) (*DeleteBlobOutput, error) {
+	for i := 0; i < 10; i++ {
+		res, err := s.S3Backend.DeleteBlob(param)
+		switch err {
+		case syscall.ENXIO:
+			s3Log.Infof("waiting for bucket")
+			time.Sleep((time.Duration(i) + 1) * 2 * time.Second)
+		default:
+			return res, err
+		}
+	}
+
+	return nil, syscall.ENXIO
+}
+
+func (s *S3BucketEventualConsistency) DeleteBlobs(param *DeleteBlobsInput) (*DeleteBlobsOutput, error) {
+	for i := 0; i < 10; i++ {
+		res, err := s.S3Backend.DeleteBlobs(param)
+		switch err {
+		case syscall.ENXIO:
+			s3Log.Infof("waiting for bucket")
+			time.Sleep((time.Duration(i) + 1) * 2 * time.Second)
+		default:
+			return res, err
+		}
+	}
+
+	return nil, syscall.ENXIO
+}
+
+func (s *S3BucketEventualConsistency) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, error) {
+	for i := 0; i < 10; i++ {
+		res, err := s.S3Backend.CopyBlob(param)
+		switch err {
+		case syscall.ENXIO:
+			s3Log.Infof("waiting for bucket")
+			time.Sleep((time.Duration(i) + 1) * 2 * time.Second)
+		default:
+			return res, err
+		}
+	}
+
+	return nil, syscall.ENXIO
+}
+
+func (s *S3BucketEventualConsistency) PutBlob(param *PutBlobInput) (*PutBlobOutput, error) {
+	s.mu.Lock()
+	s.blobs[param.Key] = true
+	s.mu.Unlock()
+
+	for i := 0; i < 10; i++ {
+		res, err := s.S3Backend.PutBlob(param)
+		switch err {
+		case syscall.ENXIO:
+			param.Body.Seek(0, 0)
+			s3Log.Infof("waiting for bucket")
+			time.Sleep((time.Duration(i) + 1) * 2 * time.Second)
+		default:
+			return res, err
+		}
+	}
+
+	return nil, syscall.ENXIO
+}
+
+func (s *S3BucketEventualConsistency) RemoveBucket(param *RemoveBucketInput) (*RemoveBucketOutput, error) {
+	for i := 0; i < 10; i++ {
+		res, err := s.S3Backend.RemoveBucket(param)
+		switch err {
+		case syscall.ENXIO:
+			s3Log.Infof("waiting for bucket")
+			time.Sleep((time.Duration(i) + 1) * 2 * time.Second)
+		default:
+			return res, err
+		}
+	}
+
+	return nil, syscall.ENXIO
 }

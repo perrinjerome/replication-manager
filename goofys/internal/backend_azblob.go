@@ -21,7 +21,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -60,27 +59,8 @@ var pipelineHTTPClient = newDefaultHTTPClient()
 
 // Clone of https://github.com/Azure/azure-pipeline-go/blob/master/pipeline/core.go#L202
 func newDefaultHTTPClient() *http.Client {
-	// We want the Transport to have a large connection pool
 	return &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.DefaultTransport.(*http.Transport).Proxy,
-			// We use Dial instead of DialContext as DialContext has been reported to cause slower performance.
-			Dial /*Context*/ : (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-				DualStack: true,
-			}).Dial, /*Context*/
-			MaxIdleConns:           0, // No limit
-			MaxIdleConnsPerHost:    100,
-			IdleConnTimeout:        90 * time.Second,
-			TLSHandshakeTimeout:    10 * time.Second,
-			ExpectContinueTimeout:  1 * time.Second,
-			DisableKeepAlives:      false,
-			DisableCompression:     false,
-			MaxResponseHeaderBytes: 0,
-			//ResponseHeaderTimeout:  time.Duration{},
-			//ExpectContinueTimeout:  time.Duration{},
-		},
+		Transport: GetHTTPTransport(),
 	}
 }
 
@@ -214,6 +194,10 @@ func NewAZBlob(container string, config *AZBlobConfig) (*AZBlob, error) {
 	}
 
 	return b, nil
+}
+
+func (b *AZBlob) Delegate() interface{} {
+	return b
 }
 
 func (b *AZBlob) Capabilities() *Capabilities {
@@ -436,7 +420,7 @@ func nilMetadata(m map[string]*string) map[string]string {
 	metadata := make(map[string]string)
 	for k, v := range m {
 		k = strings.ToLower(k)
-		metadata[k] = nilStr(v)
+		metadata[k] = NilStr(v)
 	}
 	return metadata
 }
@@ -486,13 +470,6 @@ func (b *AZBlob) HeadBlob(param *HeadBlobInput) (*HeadBlobOutput, error) {
 	}, nil
 }
 
-func nilStr(v *string) string {
-	if v == nil {
-		return ""
-	} else {
-		return *v
-	}
-}
 func nilUint32(v *uint32) uint32 {
 	if v == nil {
 		return 0
@@ -519,7 +496,7 @@ func (b *AZBlob) ListBlobs(param *ListBlobsInput) (*ListBlobsOutput, error) {
 	var nextMarker *string
 
 	options := azblob.ListBlobsSegmentOptions{
-		Prefix:     nilStr(param.Prefix),
+		Prefix:     NilStr(param.Prefix),
 		MaxResults: int32(nilUint32(param.MaxKeys)),
 		Details: azblob.BlobListingDetails{
 			// blobfuse (following wasb) convention uses
@@ -539,7 +516,7 @@ func (b *AZBlob) ListBlobs(param *ListBlobsInput) (*ListBlobsOutput, error) {
 			azblob.Marker{
 				param.ContinuationToken,
 			},
-			nilStr(param.Delimiter),
+			NilStr(param.Delimiter),
 			options)
 		if err != nil {
 			return nil, mapAZBError(err)
@@ -577,6 +554,15 @@ func (b *AZBlob) ListBlobs(param *ListBlobsInput) (*ListBlobsOutput, error) {
 		}
 	}
 
+	if len(blobItems) == 1 && len(blobItems[0].Name) <= len(options.Prefix) && strings.HasSuffix(options.Prefix, "/") {
+		// There is only 1 result and that one result does not have the desired prefix. This can
+		// happen if we ask for ListBlobs under /some/path/ and the result is List(/some/path). This
+		// means the prefix we are listing is a blob => So return empty response to indicate that
+		// this prefix should not be treated a directory by goofys.
+		// NOTE: This undesired behaviour happens only on azblob when hierarchial namespaces are
+		// enabled.
+		return &ListBlobsOutput{}, nil
+	}
 	var sortItems bool
 
 	for idx, _ := range blobItems {
@@ -644,7 +630,6 @@ func (b *AZBlob) ListBlobs(param *ListBlobsInput) (*ListBlobsOutput, error) {
 	}
 
 	return &ListBlobsOutput{
-		ContinuationToken:     param.ContinuationToken,
 		Prefixes:              prefixes,
 		Items:                 items,
 		NextContinuationToken: nextMarker,
@@ -819,7 +804,7 @@ func (b *AZBlob) PutBlob(param *PutBlobInput) (*PutBlobOutput, error) {
 	resp, err := blob.Upload(context.TODO(),
 		body,
 		azblob.BlobHTTPHeaders{
-			ContentType: nilStr(param.ContentType),
+			ContentType: NilStr(param.ContentType),
 		},
 		nilMetadata(param.Metadata), azblob.BlobAccessConditions{})
 	if err != nil {
@@ -827,7 +812,8 @@ func (b *AZBlob) PutBlob(param *PutBlobInput) (*PutBlobOutput, error) {
 	}
 
 	return &PutBlobOutput{
-		ETag: PString(string(resp.ETag())),
+		ETag:         PString(string(resp.ETag())),
+		LastModified: PTime(resp.LastModified()),
 	}, nil
 }
 
@@ -893,7 +879,8 @@ func (b *AZBlob) MultipartBlobCommit(param *MultipartBlobCommitInput) (*Multipar
 	}
 
 	return &MultipartBlobCommitOutput{
-		ETag: PString(string(resp.ETag())),
+		ETag:         PString(string(resp.ETag())),
+		LastModified: PTime(resp.LastModified()),
 	}, nil
 }
 

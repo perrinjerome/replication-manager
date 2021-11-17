@@ -19,7 +19,9 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseops"
@@ -60,6 +62,8 @@ type FileHandle struct {
 	// [1] : https://godoc.org/github.com/shirou/gopsutil/process#Process.Tgid
 	// [2] : https://github.com/shirou/gopsutil#process-class
 	Tgid *int32
+
+	keepPageCache bool // the same value we returned to OpenFile
 }
 
 const MAX_READAHEAD = uint32(400 * 1024 * 1024)
@@ -180,24 +184,21 @@ func (fh *FileHandle) waitForCreateMPU() (err error) {
 }
 
 func (fh *FileHandle) partSize() uint64 {
-	if _, ok := fh.cloud.(*ADLv1); ok {
-		// ADLv1 fails with 404 if we upload data larger than
-		// 30000000 bytes (28.6MB) (28MB also failed in reality)
-		return 20 * 1024 * 1024
-	}
+	var size uint64
 
 	if fh.lastPartId < 1000 {
-		return 5 * 1024 * 1024
+		size = 5 * 1024 * 1024
 	} else if fh.lastPartId < 2000 {
-		return 25 * 1024 * 1024
+		size = 25 * 1024 * 1024
 	} else {
-		maxPartSize := fh.cloud.Capabilities().MaxMultipartSize
-		tryPartSize := uint64(125 * 1024 * 1024)
-		if maxPartSize != 0 {
-			tryPartSize = MinUInt64(tryPartSize, maxPartSize)
-		}
-		return tryPartSize
+		size = 125 * 1024 * 1024
 	}
+
+	maxPartSize := fh.cloud.Capabilities().MaxMultipartSize
+	if maxPartSize != 0 {
+		size = MinUInt64(maxPartSize, size)
+	}
+	return size
 }
 
 func (fh *FileHandle) uploadCurrentBuf(parallel bool) (err error) {
@@ -231,6 +232,11 @@ func (fh *FileHandle) WriteFile(offset int64, data []byte) (err error) {
 	defer fh.mu.Unlock()
 
 	if fh.lastWriteError != nil {
+		fh.inode.mu.Lock()
+		// our write failed, next time we open we should not
+		// use page cache so we will read from cloud again
+		fh.inode.invalidateCache = true
+		fh.inode.mu.Unlock()
 		return fh.lastWriteError
 	}
 
@@ -243,6 +249,17 @@ func (fh *FileHandle) WriteFile(offset int64, data []byte) (err error) {
 	if offset == 0 {
 		fh.poolHandle = fh.inode.fs.bufferPool
 		fh.dirty = true
+		fh.inode.mu.Lock()
+		// we are updating this file, set knownETag to nil so
+		// on next lookup we won't think it's changed, to
+		// always prefer to read back our own write. We set
+		// this back to the ETag at flush time
+		//
+		// XXX this doesn't actually work, see the notes in
+		// Goofys.OpenFile about KeepPageCache
+		fh.inode.knownETag = nil
+		fh.inode.invalidateCache = false
+		fh.inode.mu.Unlock()
 	}
 
 	for {
@@ -268,12 +285,17 @@ func (fh *FileHandle) WriteFile(offset int64, data []byte) (err error) {
 	}
 
 	fh.inode.Attributes.Size = uint64(fh.nextWriteOffset)
+	fh.inode.Attributes.Mtime = time.Now()
 
 	return
 }
 
 type S3ReadBuffer struct {
-	s3     StorageBackend
+	s3          StorageBackend
+	startOffset uint64
+	nRetries    uint8
+	mbuf        *MBuf
+
 	offset uint64
 	size   uint32
 	buf    *Buffer
@@ -282,14 +304,21 @@ type S3ReadBuffer struct {
 func (b S3ReadBuffer) Init(fh *FileHandle, offset uint64, size uint32) *S3ReadBuffer {
 	b.s3 = fh.cloud
 	b.offset = offset
+	b.startOffset = offset
 	b.size = size
+	b.nRetries = 3
 
-	mbuf := MBuf{}.Init(fh.poolHandle, uint64(size), false)
-	if mbuf == nil {
+	b.mbuf = MBuf{}.Init(fh.poolHandle, uint64(size), false)
+	if b.mbuf == nil {
 		return nil
 	}
 
-	b.buf = Buffer{}.Init(mbuf, func() (io.ReadCloser, error) {
+	b.initBuffer(fh, offset, size)
+	return &b
+}
+
+func (b *S3ReadBuffer) initBuffer(fh *FileHandle, offset uint64, size uint32) {
+	getFunc := func() (io.ReadCloser, error) {
 		resp, err := b.s3.GetBlob(&GetBlobInput{
 			Key:   fh.key,
 			Start: offset,
@@ -300,9 +329,13 @@ func (b S3ReadBuffer) Init(fh *FileHandle, offset uint64, size uint32) *S3ReadBu
 		}
 
 		return resp.Body, nil
-	})
+	}
 
-	return &b
+	if b.buf == nil {
+		b.buf = Buffer{}.Init(b.mbuf, getFunc)
+	} else {
+		b.buf.ReInit(getFunc)
+	}
 }
 
 func (b *S3ReadBuffer) Read(offset uint64, p []byte) (n int, err error) {
@@ -319,6 +352,17 @@ func (b *S3ReadBuffer) Read(offset uint64, p []byte) (n int, err error) {
 			b.offset += uint64(n)
 			b.size -= uint32(n)
 		}
+		if b.size == 0 && err != nil {
+			// we've read everything, sometimes we may
+			// request for more bytes then there's left in
+			// this chunk so we could get an error back,
+			// ex: http2: response body closed this
+			// doesn't tend to happen because our chunks
+			// are aligned to 4K and also 128K (except for
+			// the last chunk, but seems kernel requests
+			// for a smaller buffer for the last chunk)
+			err = nil
+		}
 
 		return
 	} else {
@@ -331,15 +375,37 @@ func (b *S3ReadBuffer) Read(offset uint64, p []byte) (n int, err error) {
 func (fh *FileHandle) readFromReadAhead(offset uint64, buf []byte) (bytesRead int, err error) {
 	var nread int
 	for len(fh.buffers) != 0 {
-		nread, err = fh.buffers[0].Read(offset+uint64(bytesRead), buf)
+		readAheadBuf := fh.buffers[0]
+
+		nread, err = readAheadBuf.Read(offset+uint64(bytesRead), buf)
 		bytesRead += nread
 		if err != nil {
+			if err == io.EOF && readAheadBuf.size != 0 {
+				// in case we hit
+				// https://github.com/signal18/replication-manager/goofys/issues/464
+				// again, this will convert that into
+				// an error
+				fuseLog.Errorf("got EOF when data remains: %v", *fh.inode.FullName())
+				err = io.ErrUnexpectedEOF
+			} else if err != io.EOF && readAheadBuf.size > 0 {
+				// we hit some other errors when
+				// reading from this part. If we can
+				// retry, do that
+				if readAheadBuf.nRetries > 0 {
+					readAheadBuf.nRetries -= 1
+					readAheadBuf.initBuffer(fh, readAheadBuf.offset, readAheadBuf.size)
+					// we unset error and return,
+					// so upper layer will retry
+					// this read
+					err = nil
+				}
+			}
 			return
 		}
 
-		if fh.buffers[0].size == 0 {
+		if readAheadBuf.size == 0 {
 			// we've exhausted the first buffer
-			fh.buffers[0].buf.Close()
+			readAheadBuf.buf.Close()
 			fh.buffers = fh.buffers[1:]
 		}
 
@@ -531,11 +597,9 @@ func (fh *FileHandle) Release() {
 	fh.inode.mu.Lock()
 	defer fh.inode.mu.Unlock()
 
-	if fh.inode.fileHandles == 0 {
+	if atomic.AddInt32(&fh.inode.fileHandles, -1) == -1 {
 		panic(fh.inode.fileHandles)
 	}
-
-	fh.inode.fileHandles -= 1
 }
 
 func (fh *FileHandle) readFromStream(offset int64, buf []byte) (bytesRead int, err error) {
@@ -602,17 +666,34 @@ func (fh *FileHandle) flushSmallFile() (err error) {
 	if err != nil {
 		fh.lastWriteError = err
 	} else {
-		inode := fh.inode
-		inode.mu.Lock()
-		defer inode.mu.Unlock()
-		if resp.ETag != nil {
-			inode.s3Metadata["etag"] = []byte(*resp.ETag)
-		}
-		if resp.StorageClass != nil {
-			inode.s3Metadata["storage-class"] = []byte(*resp.StorageClass)
-		}
+		fh.updateFromFlush(resp.ETag, resp.LastModified, resp.StorageClass)
 	}
 	return
+}
+
+// LOCKS_EXCLUDED(fh.inode.mu)
+func (fh *FileHandle) updateFromFlush(etag *string, lastModified *time.Time, storageClass *string) {
+	inode := fh.inode
+	inode.mu.Lock()
+	defer inode.mu.Unlock()
+
+	if etag != nil {
+		inode.s3Metadata["etag"] = []byte(*etag)
+	}
+	if storageClass != nil {
+		inode.s3Metadata["storage-class"] = []byte(*storageClass)
+	}
+	if fh.keepPageCache {
+		// if this write didn't update page cache, don't try
+		// to update these values so on next lookup, we would
+		// invalidate the cache. We want to do that because
+		// our cache could have been populated by subsequent
+		// reads
+		if lastModified != nil {
+			inode.Attributes.Mtime = *lastModified
+		}
+		inode.knownETag = etag
+	}
 }
 
 func (fh *FileHandle) resetToKnownSize() {
@@ -634,6 +715,17 @@ func (fh *FileHandle) FlushFile() (err error) {
 		if fh.lastWriteError != nil {
 			err = fh.lastWriteError
 			fh.resetToKnownSize()
+		}
+		return
+	}
+
+	if fh.inode.Parent == nil {
+		// the file is deleted
+		if fh.mpuId != nil {
+			go func() {
+				_, _ = fh.cloud.MultipartBlobAbort(fh.mpuId)
+				fh.mpuId = nil
+			}()
 		}
 		return
 	}
@@ -691,10 +783,12 @@ func (fh *FileHandle) FlushFile() (err error) {
 		fh.buf = nil
 	}
 
-	_, err = fh.cloud.MultipartBlobCommit(fh.mpuId)
+	resp, err := fh.cloud.MultipartBlobCommit(fh.mpuId)
 	if err != nil {
 		return
 	}
+
+	fh.updateFromFlush(resp.ETag, resp.LastModified, resp.StorageClass)
 
 	fh.mpuId = nil
 
